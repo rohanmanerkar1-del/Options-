@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+logs/
+*.log
+config.py
+tokens.txt
+mn.txt
+update_mn.py
+.gemini/

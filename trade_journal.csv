@@ -1,0 +1,2 @@
+Timestamp,Symbol,Strike,ExpiryType,Entry,Exit,PnL,EntryReason,ExitReason
+2026-01-14 21:53:42,NFO:NIFTY26JAN25650PE,25650,Weekly/Monthly,100.0,100.0,0.0,Bot Signal,TIME_DECAY_RISK

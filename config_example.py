@@ -1,0 +1,8 @@
+# Zerodha Credentials
+API_KEY = "YOUR_API_KEY_HERE"
+API_SECRET = "YOUR_API_SECRET_HERE"
+ACCESS_TOKEN = "YOUR_ACCESS_TOKEN_HERE"
+
+# Trading Settings
+CAPITAL = 50000  # Default Capital
+RISK_PER_TRADE = 0.02 # 2% risk

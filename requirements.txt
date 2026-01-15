@@ -1,0 +1,8 @@
+numpy
+scipy
+python-dotenv
+requests
+logzero
+websocket-client
+
+kiteconnect
