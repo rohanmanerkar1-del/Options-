@@ -15,6 +15,7 @@ from auto_symbol_selector import pick_best_symbol
 import oi_analysis_engine
 import hedging_engine
 import timeframe_engine
+import telegram_interface
 
 
 # -------------------------------------------------------------------------
@@ -50,12 +51,19 @@ def validate_option(symbol, kite):
         
     return ltp
 
-def suggest_trade(capital, margin):
+def suggest_trade(capital, margin, **kwargs):
     """
     Analyzes market with Advanced Quantitative Logic.
     Strict Compliance: Zerodha Kite Only.
     """
-    print(f"\n--- ZERODHA QUANT OPTION BOT ---")
+    # Initialize Logger if not provided (fallback for legacy calls, though we should always pass it)
+    import logger as logger_module
+    if 'logger' not in kwargs:
+         logger = logger_module.TelegramLogger() # Local instance if none passed
+    else:
+         logger = kwargs['logger']
+
+    logger.log(f"\n--- ZERODHA QUANT OPTION BOT ---")
     
     # 3. Get API Instance
     kite = kite_data.get_kite()
@@ -65,7 +73,7 @@ def suggest_trade(capital, margin):
     risk_level = profile.get("risk_level", "medium")
     
     # 2. Auto-Selection Execution
-    print("[*] Scanning Markets (Trend/Momentum/Volatility)...")
+    logger.log("[*] Scanning Markets (Trend/Momentum/Volatility)...")
     symbol, reason_msg, trend_dir, volatility, spot_price = pick_best_symbol()
     
     if spot_price is None or spot_price == 0:
@@ -81,7 +89,7 @@ def suggest_trade(capital, margin):
         spot_price = kite_data.get_ltp(symbol, kite)
 
     if spot_price is None or spot_price == 0:
-        print("[!] Could not fetch Spot Price. Aborting.")
+        logger.log("[!] Could not fetch Spot Price. Aborting.")
         return
 
     # 3. New Quantitative Checks
@@ -110,17 +118,17 @@ def suggest_trade(capital, margin):
     # Timeframe
     timeframe = timeframe_engine.pick_timeframe(volatility)
     
-    print("\n========================================")
-    print(f" MARKET CONTEXT: {symbol}")
-    print("========================================")
-    print(f"Trend      : {trend_dir} (Reason: {reason_msg})")
-    print(f"Volatility : {volatility}")
-    print(f"Timeframe  : {timeframe}")
-    print(f"OI Signal  : {oi_signal} (PCR: {pcr:.2f})")
-    print(f"IV Rank    : {iv_rank} (IV: {iv if iv else 'N/A'})")
-    print(f"Spot Price : {spot_price}")
-    print("========================================")
-    print(f"Capital: {capital} | Avail Margin: {margin}")
+    logger.log("\n========================================")
+    logger.log(f" MARKET CONTEXT: {symbol}")
+    logger.log("========================================")
+    logger.log(f"Trend      : {trend_dir} (Reason: {reason_msg})")
+    logger.log(f"Volatility : {volatility}")
+    logger.log(f"Timeframe  : {timeframe}")
+    logger.log(f"OI Signal  : {oi_signal} (PCR: {pcr:.2f})")
+    logger.log(f"IV Rank    : {iv_rank} (IV: {iv if iv else 'N/A'})")
+    logger.log(f"Spot Price : {spot_price}")
+    logger.log("========================================")
+    logger.log(f"Capital: {capital} | Avail Margin: {margin}")
     
     # Decide Strategy
     final_view = "BULLISH" # Default logic from trend/pcr
@@ -130,7 +138,7 @@ def suggest_trade(capital, margin):
         if pcr < 0.8: final_view = "BEARISH"
         else: final_view = "BULLISH"
         
-    print(f"[-] Final View: {final_view}")
+    logger.log(f"[-] Final View: {final_view}")
     
     # Strike Integration
     atm = atm_engine.get_atm_strike(spot_price, symbol)
@@ -150,7 +158,7 @@ def suggest_trade(capital, margin):
     
     if margin >= 150000:
         # HIGH MARGIN -> Sell Strategies
-        print(f"[-] High Margin (>=1.5L). Strategy: OPTION SELLING")
+        logger.log(f"[-] High Margin (>=1.5L). Strategy: OPTION SELLING")
         # Invert View for Selling
         sell_type = "PE" if final_view == "BULLISH" else "CE"
         action = "SELL"
@@ -166,7 +174,7 @@ def suggest_trade(capital, margin):
         
         # 8. DO NOT PLACE TRADES WITHOUT VALID LTP
         if prem is None:
-            print(f"[!] Validation Failed for {sym}. Abort trade.")
+            logger.log(f"[!] Validation Failed for {sym}. Abort trade.")
             return
 
         # Check Margin again
@@ -187,8 +195,8 @@ def suggest_trade(capital, margin):
             final_view, capital, margin, symbol, expiry_data, atm
         )
         strategy_name = hedged_strat['name']
-        print(f"    -> Suggesting: {strategy_name}")
-        print(f"    -> Reason: {hedged_strat['reason']}")
+        logger.log(f"    -> Suggesting: {strategy_name}")
+        logger.log(f"    -> Reason: {hedged_strat['reason']}")
         is_hedged = True
         
         # Construct Legs
@@ -199,9 +207,9 @@ def suggest_trade(capital, margin):
             
             prem = validate_option(leg_sym, kite)
             if prem is None:
-                print(f"[!] Validation Failed for {leg_sym}. Skipping Leg.")
+                logger.log(f"[!] Validation Failed for {leg_sym}. Skipping Leg.")
                 # We should strictly abort the whole strategy if one leg fails validation to avoid naked positions
-                print("[!] Strategy Aborted due to leg failure.")
+                logger.log("[!] Strategy Aborted due to leg failure.")
                 return 
                 
             final_trade_legs.append({
@@ -214,7 +222,7 @@ def suggest_trade(capital, margin):
     else:
         # LOW MARGIN -> Buy Cheap OTM/ATM
         opt_type = "CE" if final_view == "BULLISH" else "PE"
-        print(f"[-] Low Margin (<50k). Strategy: BUY OPTION {opt_type}")
+        logger.log(f"[-] Low Margin (<50k). Strategy: BUY OPTION {opt_type}")
         action = "BUY"
         
         # OTM Engine needs 'kite' passed
@@ -222,14 +230,14 @@ def suggest_trade(capital, margin):
         
         # Validate the OTM pick
         if otm_data["premium"] is None or otm_data["premium"] == 0:
-             print("[!] No valid premium found for Buying. Abort.")
+             logger.log("[!] No valid premium found for Buying. Abort.")
              return
              
         # Double Check Validation on the found symbol
         # OTM engine might have returned a symbol, but we need to check Vol/OI
         check_prem = validate_option(otm_data["symbol"], kite)
         if not check_prem:
-             print("[!] Selected OTM failed strict validation (Vol/OI).")
+             logger.log("[!] Selected OTM failed strict validation (Vol/OI).")
              return
 
         final_trade_legs.append({
@@ -240,28 +248,48 @@ def suggest_trade(capital, margin):
         })
     
     # 5. Output Trade Plan
-    print("\n========================================")
-    print(f" TRADE PLAN: {strategy_name if is_hedged else (action + ' ' + opt_type)}")
-    print("========================================")
+    logger.log("\n========================================")
+    logger.log(f" TRADE PLAN: {strategy_name if is_hedged else (action + ' ' + opt_type)}")
+    logger.log("========================================")
     
     total_cost = 0
     total_margin = 0
     
     for leg in final_trade_legs:
         val = leg['qty'] * leg['premium']
-        print(f"Leg {final_trade_legs.index(leg)+1}: {leg['action']} {leg['symbol']} @ {leg['premium']}")
-        print(f"       Qty: {leg['qty']} | Val: {val:.2f}")
-        
+
+        # Calculate SL/Target for Display
+        sl_price = 0
+        target_price = 0
         if leg['action'] == "BUY":
+            sl_price = leg['premium'] * 0.80   # 20% SL
+            target_price = leg['premium'] * 1.30 # 30% Target
             total_cost += val
         else:
+            sl_price = leg['premium'] * 1.30   # 30% SL (Short)
+            target_price = leg['premium'] * 0.50 # 50% Target (Short)
             total_cost -= val # Premium received
             
             # Simple margin est
             total_margin += 60000 # Rough est per lot short
+
+        logger.log(f"Leg {final_trade_legs.index(leg)+1}: {leg['action']} {leg['symbol']} @ {leg['premium']}")
+        logger.log(f"       Qty: {leg['qty']} | Val: {val:.2f}")
+        logger.log(f"       🛑 SL: {sl_price:.2f} | 🎯 Tgt: {target_price:.2f}")
+
+        # Store for alert
+        leg['sl'] = sl_price
+        leg['target'] = target_price
             
-    print(f"Net Premium Impact: {total_cost:.2f} ({'Debit' if total_cost > 0 else 'Credit'})")
-    print(f"\nEst. Capital/Margin Req: {total_margin if total_margin > 0 else total_cost:.2f}")
+    logger.log(f"Net Premium Impact: {total_cost:.2f} ({'Debit' if total_cost > 0 else 'Credit'})")
+    logger.log(f"\nEst. Capital/Margin Req: {total_margin if total_margin > 0 else total_cost:.2f}")
+
+    # 7. Send Telegram Alert
+    alert_msg = f"🚀 *Trade Suggestion*\n\n"
+    alert_msg += f"Symbol: {symbol}\nView: {final_view}\nStrateg: {strategy_name if is_hedged else (action + ' ' + opt_type)}\n"
+    alert_msg += f"Spot: {spot_price}\n\n*Legs:*\n"
+    for leg in final_trade_legs:
+        alert_msg += f"{leg['action']} {leg['symbol']} @ {leg['premium']}\nTo: 🎯 {leg['target']:.1f} | 🛑 {leg['sl']:.1f}\n(Qty: {leg['qty']})\n"
+    alert_msg += f"\nEst. Cost: {total_margin if total_margin > 0 else total_cost:.2f}"
     
-    # 6. Monitor Loop Option
-    # ...
+    telegram_interface.send_alert(alert_msg)
