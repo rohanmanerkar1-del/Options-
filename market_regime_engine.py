@@ -3,9 +3,12 @@ import numpy as np
 import kite_data
 
 def get_market_regime(symbol="NIFTY"):
+    metrics = get_market_metrics(symbol)
+    return metrics.get("regime", "SIDEWAYS")
+    
+def get_market_metrics(symbol="NIFTY"):
     """
-    Analyzes the market regime using EMA, RSI, and ATR.
-    Returns: regime string ("TRENDING_UP", "TRENDING_DOWN", "SIDEWAYS", "VOLATILE", "SLOW")
+    Returns dict with Regime, ATR, RSI etc.
     """
     try:
         # Fetch Data via Kite (approx 3 months -> 90 days)
@@ -13,12 +16,11 @@ def get_market_regime(symbol="NIFTY"):
         candles = kite_data.get_historical_data(symbol, interval="1d", days=120)
         
         if not candles:
-            return "SIDEWAYS" # Fallback
+            return {"regime": "SIDEWAYS", "atr": 0, "avg_atr": 0, "spot_price": 0, "iv_rank": 0}
             
         data = pd.DataFrame(candles)
         
-        # Rename lower case to Title Case for consistency if needed, but Zerodha gives 'close'
-        # We need to standardize column names to: Close, High, Low, Open
+        # Rename lower case to Title Case
         data.rename(columns={'close': 'Close', 'high': 'High', 'low': 'Low', 'open': 'Open'}, inplace=True)
         
         # Indicators
@@ -38,7 +40,19 @@ def get_market_regime(symbol="NIFTY"):
         low_close = np.abs(data['Low'] - data['Close'].shift())
         ranges = pd.concat([high_low, high_close, low_close], axis=1)
         true_range = np.max(ranges, axis=1)
+        # ATR (Vol proxy)
+        high_low = data['High'] - data['Low']
+        high_close = np.abs(data['High'] - data['Close'].shift())
+        low_close = np.abs(data['Low'] - data['Close'].shift())
+        ranges = pd.concat([high_low, high_close, low_close], axis=1)
+        true_range = np.max(ranges, axis=1)
         data['ATR'] = true_range.rolling(14).mean()
+        
+        # HISTORICAL VOLATILITY (HV) - 20 Day Annualized
+        # Log Returns
+        data['LogRet'] = np.log(data['Close'] / data['Close'].shift(1))
+        # Rolling Std Dev * Sqrt(252) * 100
+        data['HV'] = data['LogRet'].rolling(window=20).std() * np.sqrt(252) * 100
         
         current = data.iloc[-1]
         
@@ -48,6 +62,8 @@ def get_market_regime(symbol="NIFTY"):
         ema50 = current['EMA50']
         rsi = current['RSI']
         atr = current['ATR']
+        hv = current.get('HV', 0)
+        if np.isnan(hv): hv = 0
         avg_atr = data['ATR'].mean()
         
         # 1. Volatility Check
@@ -55,20 +71,28 @@ def get_market_regime(symbol="NIFTY"):
         is_slow = atr < (avg_atr * 0.7)
         
         # 2. Trend Check
+        regime = "SIDEWAYS"
         if price > ema20 > ema50:
-            if is_volatile: return "VOLATILE_UP"
-            return "TRENDING_UP"
-            
+            if is_volatile: regime = "VOLATILE_UP"
+            else: regime = "TRENDING_UP"
         elif price < ema20 < ema50:
-            if is_volatile: return "VOLATILE_DOWN"
-            return "TRENDING_DOWN"
-            
+            if is_volatile: regime = "VOLATILE_DOWN"
+            else: regime = "TRENDING_DOWN"
         else:
-            # Sideways or unclear
-            if is_volatile: return "VOLATILE"
-            if is_slow: return "SLOW"
-            return "SIDEWAYS"
+            if is_volatile: regime = "VOLATILE"
+            elif is_slow: regime = "SLOW"
+            else: regime = "SIDEWAYS"
+            
+        return {
+            "regime": regime,
+            "atr": atr,
+            "avg_atr": avg_atr,
+            "hv": hv,
+            "rsi": rsi,
+            "spot_price": price,
+            "trend_strength": abs(price - ema50) / price * 100 # Approx % deviation
+        }
             
     except Exception as e:
         print(f"[Regime] Error: {e}")
-        return "SIDEWAYS" # Safe Fallback
+        return {"regime": "SIDEWAYS", "atr": 0, "avg_atr": 0, "spot_price": 0}

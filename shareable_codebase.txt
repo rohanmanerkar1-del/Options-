@@ -1,0 +1,3371 @@
+
+
+--- FILE: atm_engine.py ---
+
+def get_atm_strike(spot_price, symbol):
+    """
+    --- 4. FIX ATM STRIKE CALCULATION ---
+    """
+    # Normalize
+    underlying = symbol.upper()
+    if "NIFTY" in underlying and "BANK" not in underlying and "FIN" not in underlying:
+         underlying = "NIFTY"
+    if "BANK" in underlying: underlying = "BANKNIFTY"
+    
+    if underlying == "BANKNIFTY":
+        step = 100
+    elif underlying == "NIFTY":
+        step = 50
+    else:
+        step = 10
+        
+    return round(spot_price / step) * step
+
+def get_otm_strikes(atm, symbol, option_type="CE", count=5):
+    """
+    Returns list of OTM strikes using the same step logic.
+    """
+    underlying = symbol.upper()
+    if "NIFTY" in underlying and "BANK" not in underlying: underlying = "NIFTY"
+    if "BANK" in underlying: underlying = "BANKNIFTY"
+
+    if underlying == "BANKNIFTY": step = 100
+    elif underlying == "NIFTY": step = 50
+    else: step = 10
+    
+    strikes = []
+    for i in range(1, count + 1):
+        if option_type == "CE":
+            strikes.append(atm + (i * step))
+        else:
+            strikes.append(atm - (i * step))
+            
+    return strikes
+
+
+--- FILE: auto_symbol_selector.py ---
+
+import kite_data
+import pandas as pd
+import numpy as np
+import time
+
+# List of instruments to scan
+SYMBOL_LIST = [
+    "NIFTY",
+    "BANKNIFTY",
+    "FINNIFTY",
+    "RELIANCE",
+    "HDFCBANK",
+    "ICICIBANK",
+    "SBIN",
+    "TCS",
+    "INFY"
+]
+
+def fetch_data(symbol):
+    """
+    Fetches historical data for a symbol to calculate indicators.
+    Returns DataFrame or None if failed.
+    """
+    try:
+        # Fetch 5-day history on 5-min timeframe for reliable intraday trend
+        candles = kite_data.get_historical_data(symbol, interval="5minute", days=5)
+        if not candles or len(candles) < 50:
+            return None
+            
+        df = pd.DataFrame(candles)
+        return df
+    except Exception as e:
+        print(f"[AutoSelect] Error fetching data for {symbol}: {e}")
+        return None
+
+def calculate_indicators(df):
+    """
+    Adds ATR, EMA20, EMA50, RSI to the DataFrame.
+    """
+    try:
+        # EMA
+        df['EMA20'] = df['close'].ewm(span=20, adjust=False).mean()
+        df['EMA50'] = df['close'].ewm(span=50, adjust=False).mean()
+        
+        # RSI (14)
+        delta = df['close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        df['RSI'] = 100 - (100 / (1 + rs))
+        
+        # ATR (14)
+        df['H-L'] = df['high'] - df['low']
+        df['H-PC'] = abs(df['high'] - df['close'].shift(1))
+        df['L-PC'] = abs(df['low'] - df['close'].shift(1))
+        df['TR'] = df[['H-L', 'H-PC', 'L-PC']].max(axis=1)
+        df['ATR'] = df['TR'].rolling(window=14).mean()
+        
+        return df
+    except Exception as e:
+        print(f"[AutoSelect] Error calculating indicators: {e}")
+        return df
+
+def score_symbol(symbol, df):
+    """
+    Scores a symbol based on Trend, Momentum, and Volatility directly.
+    Returns: score (float), details (dict)
+    """
+    current = df.iloc[-1]
+    prev = df.iloc[-2] # To check crossing
+    
+    score = 0
+    reasons = []
+    
+    close = current['close']
+    ema20 = current['EMA20']
+    ema50 = current['EMA50']
+    rsi = current['RSI']
+    atr = current['ATR']
+    
+    # --- 1. TREND SCORE (Max 5) ---
+    trend = "SIDEWAYS"
+    if close > ema20 > ema50:
+        score += 3
+        trend = "UP"
+        reasons.append("Strong Uptrend")
+    elif close < ema20 < ema50:
+        score += 3
+        trend = "DOWN"
+        reasons.append("Strong Downtrend")
+    elif close > ema20:
+        score += 1
+        trend = "WEAK_UP"
+    elif close < ema20:
+        score += 1
+        trend = "WEAK_DOWN"
+        
+    # Breakout Bonus
+    if (prev['close'] < prev['EMA20']) and (close > ema20):
+        score += 2
+        reasons.append("Fresh Breakout")
+    elif (prev['close'] > prev['EMA20']) and (close < ema20):
+        score += 2
+        reasons.append("Fresh Breakdown")
+        
+    # --- 2. MOMENTUM SCORE (Max 3) ---
+    if 55 < rsi < 70:
+        score += 2
+        reasons.append("Bullish Momentum")
+    elif 30 < rsi < 45:
+        score += 2
+        reasons.append("Bearish Momentum")
+        
+    # --- 3. VOLATILITY/ACTIVITY (Max 2) ---
+    avg_atr = df['ATR'].mean()
+    if atr > avg_atr * 1.1:
+        score += 1.5
+        reasons.append("High Volatility")
+        volatility = "High"
+    elif atr < avg_atr * 0.8:
+        reasons.append("Low Volatility")
+        volatility = "Low"
+    else:
+        volatility = "Normal"
+
+    # --- 4. INDEX BIAS ---
+    if symbol in ["NIFTY", "BANKNIFTY", "FINNIFTY"]:
+        score += 0.5
+        
+    return score, {
+        "symbol": symbol,
+        "score": score,
+        "trend": trend,
+        "volatility": volatility,
+        "close": close,
+        "reasons": ", ".join(reasons)
+    }
+
+def pick_best_symbol():
+    """
+    Iterates through SYMBOL_LIST, fetches data, scores them, and returns the best one.
+    """
+    print(f"\n[AutoSelect] Scanning {len(SYMBOL_LIST)} symbols for best opportunity...")
+    
+    best_score = -999
+    best_pick = None
+    
+    for sym in SYMBOL_LIST:
+        print(f" -> Checking {sym}...", end="")
+        df = fetch_data(sym)
+        if df is None:
+            print(" [Skipped - No Data]")
+            continue
+            
+        df = calculate_indicators(df)
+        score, details = score_symbol(sym, df)
+        
+        print(f" Score: {score:.1f} ({details['trend']})")
+        
+        if score > best_score:
+            best_score = score
+            best_pick = details
+            
+    if best_pick:
+        return (
+            best_pick['symbol'], 
+            best_pick['reasons'], 
+            best_pick['trend'], 
+            best_pick['volatility'], 
+            best_pick['close']
+        )
+    else:
+        print("\n[AutoSelect] No suitable symbol found. Defaulting to NIFTY.")
+        return "NIFTY", "Default Fallback", "SIDEWAYS", "Normal", 0.0
+
+if __name__ == "__main__":
+    pick_best_symbol()
+
+
+--- FILE: auto_trend.py ---
+
+import kite_data
+
+def get_market_trend(symbol):
+    """
+    Analyzes 5-min historical data to determine Trend and Volatility.
+    Returns: (Trend_String, Volatility_String)
+    """
+    # Fetch last 5 days just to be sure we have enough data (though 1 day sufficient for intraday)
+    candles = kite_data.get_historical_data(symbol, interval="5minute", days=2)
+    
+    if not candles or len(candles) < 20: 
+        return "SIDEWAYS", "Normal" # Default if no data
+    
+    # Simple Logic: 
+    # Compare current close with 20-period Simple Moving Average (SMA)
+    
+    closes = [c['close'] for c in candles]
+    current_price = closes[-1]
+    
+    # Calculate SMA 20
+    period = 20
+    if len(closes) >= period:
+        sma_20 = sum(closes[-period:]) / period
+    else:
+        sma_20 = sum(closes) / len(closes)
+        
+    # Trend
+    trend = "SIDEWAYS"
+    if current_price > (sma_20 * 1.001): # 0.1% buffer
+        trend = "UP"
+    elif current_price < (sma_20 * 0.999):
+        trend = "DOWN"
+        
+    # Volatility Check (ATR or Candle Range)
+    # Simple approximate: Average range of last 5 candles
+    last_5_ranges = [(c['high'] - c['low']) for c in candles[-5:]]
+    avg_range = sum(last_5_ranges) / 5
+    price_pct = (avg_range / current_price) * 100
+    
+    volatility = "Normal"
+    if price_pct > 0.3: # If 5min candle moves > 0.3% of asset value
+        volatility = "High"
+    elif price_pct < 0.1:
+        volatility = "Low"
+        
+    return trend, volatility
+
+
+--- FILE: broker_interface.py ---
+
+from abc import ABC, abstractmethod
+
+class BrokerInterface(ABC):
+    """
+    Abstract Interface for Brokerage APIs to ensure modularity.
+    """
+    
+    @abstractmethod
+    def login(self):
+        """Authenticates the session."""
+        pass
+    
+    @abstractmethod
+    def logout(self):
+        """Closes the session safely."""
+        pass
+        
+    @abstractmethod
+    def get_ltp(self, exchange: str, symbol_token: str):
+        """Fetches Last Traded Price."""
+        pass
+        
+    @abstractmethod
+    def place_order(self, transaction_type: str, exchange: str, symbol_token: str, qty: int, order_type: str, price: float = 0):
+        """Places a buy/sell order."""
+        pass
+        
+    @abstractmethod
+    def get_positions(self):
+        """Fetches current open positions."""
+        pass
+        
+    @abstractmethod
+    def get_option_chain_data(self, symbol: str, expiry: str):
+        """Fetches option chain relevant data (LTP, OI, Volume)."""
+        pass
+
+
+--- FILE: config.py ---
+
+# Zerodha Credentials
+API_KEY = "bkz2p29mionu8yec"
+API_SECRET = "mrhxt6zy7nkz09fs67ioh412ow3pliu4"
+ACCESS_TOKEN = "xPoMGHo1B2RRew9MhhKuRi7hfu1TVhjV"
+
+# Telegram Credentials
+TELEGRAM_BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
+TELEGRAM_CHAT_ID = "YOUR_CHAT_ID_HERE"
+
+# Trading Settings
+CAPITAL = 50000  # Default Capital
+RISK_PER_TRADE = 0.02 # 2% risk
+ALGO_ID = "OPTIONS_BOT_V2"
+
+# Rate Limiting & Network
+EXCHANGE_MAX_OPS = 10
+WHITELISTED_IP = "127.0.0.1"
+
+# Strategy Settings
+USE_MOCK_BROKER = False
+STRATEGY_TIME = "09:20"
+MAX_POSITION_SIZE = 50 
+STOP_LOSS_PER_LOT = 30
+TARGET_PROFIT_PER_LOT = 100
+
+
+--- FILE: config_example.py ---
+
+# Zerodha Credentials
+API_KEY = "YOUR_API_KEY_HERE"
+API_SECRET = "YOUR_API_SECRET_HERE"
+ACCESS_TOKEN = "YOUR_ACCESS_TOKEN_HERE"
+
+# Telegram Credentials
+TELEGRAM_BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
+TELEGRAM_CHAT_ID = "YOUR_CHAT_ID_HERE"
+
+# Trading Settings
+CAPITAL = 50000  # Default Capital
+RISK_PER_TRADE = 0.02 # 2% risk
+
+
+--- FILE: exit_engine.py ---
+
+import datetime
+
+def should_exit_by_target(entry_price, current_price, target_price=0):
+    """
+    Exit if current price hits target.
+    If target_price is provided, use it. Else default to 1.30x.
+    """
+    if entry_price <= 0: return False
+    
+    if target_price > 0:
+        return current_price >= target_price
+        
+    return current_price >= (entry_price * 1.30)
+
+def should_exit_by_stoploss(entry_price, current_price, sl_price=0):
+    """
+    Exit if current price hits SL.
+    If sl_price is provided, use it. Else default to 0.80x.
+    """
+    if entry_price <= 0: return False
+    
+    if sl_price > 0:
+        return current_price <= sl_price
+        
+    return current_price <= (entry_price * 0.80)
+
+def should_exit_by_trailing_sl(current_price, trailing_sl_price):
+    """
+    Exit if current price drops below dynamic trailing SL.
+    """
+    if trailing_sl_price <= 0: return False
+    return current_price < trailing_sl_price
+
+def should_exit_by_time_decay(days_left, is_otm=False):
+    """
+    - If days_left <= 2 and trade is OTM -> exit (Theta Decay Risk)
+    """
+    if days_left <= 2 and is_otm:
+        return True
+    if days_left <= 0:
+        return True # Expiry Exit
+    return False
+
+def should_exit_by_trend_reversal(trend_now, trend_entry):
+    """
+    - If trend_entry was UP and trend_now turns DOWN -> exit
+    - If trend_entry was DOWN and trend_now turns UP -> exit
+    """
+    trend_now = trend_now.upper()
+    trend_entry = trend_entry.upper()
+    
+    if "UP" in trend_entry and "DOWN" in trend_now:
+        return True
+    if "DOWN" in trend_entry and "UP" in trend_now:
+        return True
+        
+    return False
+
+def should_exit_short_by_iv_spike(iv_last, iv_current):
+    """
+    For Short Sellers: If IV spikes significantly (>20%), Vega risk is high.
+    Exit short positions.
+    """
+    if iv_last <= 0: return False
+    spike = (iv_current - iv_last) / iv_last
+    return spike > 0.20
+    
+def should_exit_short_by_price_spike(entry_price, current_price, sl_price=0):
+    """
+    For Short: Entry is High, Loss is Higher.
+    If current > SL -> Exit.
+    """
+    if sl_price > 0:
+        return current_price >= sl_price
+    
+    # Default 30% SL on premium
+    return current_price >= (entry_price * 1.30)
+
+def should_exit_short_by_target(entry_price, current_price, target_price=0):
+    """
+    For Short: Profit is Lower Price.
+    target_price should be < entry_price.
+    """
+    if target_price > 0:
+        return current_price <= target_price
+        
+    # Default 50% decay target
+    return current_price <= (entry_price * 0.50)
+
+
+
+--- FILE: expiry_engine.py ---
+
+import datetime
+import calendar
+
+# Holidays (Simplified List)
+HOLIDAYS_2024 = [
+    "2024-01-26", "2024-03-08", "2024-03-25", "2024-04-11",
+    "2024-04-17", "2024-05-01", "2024-06-17", "2024-07-17",
+    "2024-08-15", "2024-10-02", "2024-11-01", "2024-11-15", "2024-12-25"
+]
+
+def is_holiday(date_obj):
+    fmt = date_obj.strftime("%Y-%m-%d")
+    return fmt in HOLIDAYS_2024
+
+def get_monthly_expiry(from_date=None):
+    if from_date is None: from_date = datetime.datetime.now().date()
+    
+    # Get this month's last Thursday
+    year = from_date.year
+    month = from_date.month
+    
+    cal = calendar.monthcalendar(year, month)
+    last_week = cal[-1]
+    day = last_week[calendar.THURSDAY]
+    if day == 0:
+        day = cal[-2][calendar.THURSDAY]
+        
+    expiry = datetime.date(year, month, day)
+    
+    # If today is past expiry, get next month
+    if from_date > expiry:
+        month += 1
+        if month > 12:
+            month = 1
+            year += 1
+            
+        cal = calendar.monthcalendar(year, month)
+        last_week = cal[-1]
+        day = last_week[calendar.THURSDAY]
+        if day == 0:
+            day = cal[-2][calendar.THURSDAY]
+        expiry = datetime.date(year, month, day)
+            
+    # Handle Holiday
+    while is_holiday(expiry):
+        expiry -= datetime.timedelta(days=1)
+        
+    return expiry
+
+def get_option_symbol(underlying, expiry_date, strike, otype):
+    """
+    --- 3. FIX EXPIRY FORMAT FOR ZERODHA ---
+    Format: <UNDERLYING><YY><MON><STRIKE><CE/PE>
+    """
+    # Force Underlying Name Standard (NIFTY 50 -> NIFTY)
+    # Force Underlying Name Standard (NIFTY 50 -> NIFTY)
+    if underlying == "NIFTY 50" or underlying == "NIFTY":
+         underlying = "NIFTY"
+    elif underlying == "NIFTY BANK" or underlying == "BANKNIFTY":
+         underlying = "BANKNIFTY"
+    elif underlying == "NIFTY FIN SERVICE" or underlying == "FINNIFTY":
+         underlying = "FINNIFTY"
+    
+    year = expiry_date.strftime("%y")             # -> "24"
+    month = expiry_date.strftime("%b").upper()    # -> "JAN"
+    
+    tradingsymbol = f"{underlying}{year}{month}{strike}{otype}"
+    return tradingsymbol
+
+def get_expiry(symbol, from_date=None, use_weekly=False):
+    # Always return Monthly for now as it ensures the strict format works safely
+    # The strict format user requested is typically implied for monthly or specific weekly codes
+    # User said "Correct Zerodha option format is <UNDERLYING><YY><MON><STRIKE><CE/PE>"
+    
+    expiry_date = get_monthly_expiry(from_date)
+    return {
+        "date": expiry_date,
+        "code_monthly": "UNUSED", # Legacy key
+        "code": "UNUSED" 
+    }
+
+
+--- FILE: fetch_stock_tokens.py ---
+
+import kite_data
+
+def fetch_tokens():
+    kite = kite_data.get_kite()
+    print("Fetching NSE instruments...")
+    instruments = kite.instruments("NSE")
+    
+    targets = ["RELIANCE", "HDFCBANK", "ICICIBANK", "SBIN", "TCS", "INFY"]
+    found = {}
+    
+    for inst in instruments:
+        if inst['tradingsymbol'] in targets:
+            found[inst['tradingsymbol']] = inst['instrument_token']
+            
+    for sym, token in found.items():
+        print(f"{sym}:{token}")
+
+if __name__ == "__main__":
+    fetch_tokens()
+
+
+--- FILE: get_access_token.py ---
+
+from kiteconnect import KiteConnect
+import config
+import os
+
+def generate_token():
+    print("Initializing KiteConnect...")
+    try:
+        kite = KiteConnect(api_key=config.API_KEY)
+        
+        url = kite.login_url()
+        print("\n" + "="*50)
+        print("STEP 1: LOGIN")
+        print("="*50)
+        print("Open this URL in your browser to login:")
+        print(f"\n{url}\n")
+        print("="*50)
+        
+        print("\nSTEP 2: GET REQUEST TOKEN")
+        print("After login, you will be redirected to a URL (e.g. 127.0.0.1).")
+        print("Copy the 'request_token' parameter from that URL.")
+        
+        req_token = input("\nPaste the 'request_token' here: ").strip()
+        
+        print("\nSTEP 3: GENERATING SESSION...")
+        data = kite.generate_session(req_token, api_secret=config.API_SECRET)
+        access_token = data["access_token"]
+        
+        print("\n" + "="*50)
+        print("SUCCESS! NEW ACCESS TOKEN")
+        print("="*50)
+        print(f"\n{access_token}\n")
+        
+        # Auto-update config.py
+        update = input("Do you want me to update config.py automatically? (Y/N): ").upper()
+        if update == "Y":
+            new_lines = []
+            with open("config.py", "r") as f:
+                lines = f.readlines()
+                for line in lines:
+                    if line.startswith("ACCESS_TOKEN"):
+                        new_lines.append(f'ACCESS_TOKEN = "{access_token}"\n')
+                    else:
+                        new_lines.append(line)
+            
+            with open("config.py", "w") as f:
+                f.writelines(new_lines)
+            print("Updated config.py successfully!")
+            
+    except Exception as e:
+        print(f"\n[ERROR] Failed to generate token: {e}")
+
+if __name__ == "__main__":
+    generate_token()
+
+
+--- FILE: get_chat_id.py ---
+
+import config
+import requests
+import json
+
+def get_chat_id():
+    print("--- FETCHING CHAT ID ---")
+    token = config.TELEGRAM_BOT_TOKEN
+    url = f"https://api.telegram.org/bot{token}/getUpdates"
+    
+    try:
+        print(f"[*] Polling {url}...")
+        res = requests.get(url)
+        data = res.json()
+        
+        if not data.get("ok"):
+            print(f"❌ Error fetching updates: {data}")
+            return
+
+        updates = data.get("result", [])
+        if not updates:
+            print("[-] No messages found. Please send 'Hello' to your bot again.")
+            return
+
+        # Get last message
+        last_update = updates[-1]
+        if "message" in last_update:
+            chat = last_update["message"]["chat"]
+            chat_id = chat["id"]
+            username = chat.get("username", "Unknown")
+            first_name = chat.get("first_name", "Unknown")
+            
+            print(f"\n✅ FOUND MESSAGE FROM:")
+            print(f"   Name: {first_name}")
+            print(f"   Username: @{username}")
+            print(f"   Chat ID: {chat_id}")
+            print(f"   Text: {last_update['message'].get('text', '')}")
+            
+            print(f"\n[+] Recommended Action: Update config.py with TELEGRAM_CHAT_ID = {chat_id}")
+            return chat_id
+        else:
+            print("[-] Last update was not a text message.")
+            
+    except Exception as e:
+        print(f"❌ Connection Error: {e}")
+
+if __name__ == "__main__":
+    get_chat_id()
+
+
+--- FILE: greeks_engine.py ---
+
+import numpy as np
+from scipy.stats import norm
+import datetime
+
+# Market Constants
+RISK_FREE_RATE = 0.07 # 7% India risk-free approximation
+
+def d1_d2(S, K, T, r, sigma):
+    """
+    Calculates d1 and d2 parameters for Black-Scholes.
+    """
+    if T <= 0 or sigma <= 0:
+        return 0, 0
+    
+    # Avoid div by zero
+    T = max(T, 0.0001)
+    sigma = max(sigma, 0.001)
+    
+    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+    d2 = d1 - sigma * np.sqrt(T)
+    return d1, d2
+
+def get_greeks(S, K, T, r, sigma, option_type="CE"):
+    """
+    Returns a dictionary of Greeks.
+    S: Spot Price
+    K: Strike Price
+    T: Time to Expiry (in years)
+    r: Risk-Free Rate (decimal, e.g., 0.07)
+    sigma: IV (decimal, e.g., 0.15 for 15%)
+    option_type: "CE" or "PE"
+    """
+    # Defaults
+    greeks = {
+        "delta": 0,
+        "gamma": 0,
+        "theta": 0,
+        "vega": 0
+    }
+
+    if S <= 0 or K <= 0 or T <= 0 or sigma <= 0:
+        return greeks
+
+    d1, d2 = d1_d2(S, K, T, r, sigma)
+    
+    # Normalized PDF/CDF
+    pdf_d1 = norm.pdf(d1)
+    cdf_d1 = norm.cdf(d1)
+    cdf_d2 = norm.cdf(d2)
+    
+    if option_type == "CE":
+        delta = cdf_d1
+        # Theta (annual) -> divide by 365 for daily decay estimate usually
+        theta_annual = -(S * pdf_d1 * sigma) / (2 * np.sqrt(T)) - r * K * np.exp(-r * T) * cdf_d2
+    else: # PE
+        delta = cdf_d1 - 1
+        theta_annual = -(S * pdf_d1 * sigma) / (2 * np.sqrt(T)) + r * K * np.exp(-r * T) * (1 - cdf_d2)
+
+    # Gamma (same for Call/Put)
+    gamma = pdf_d1 / (S * sigma * np.sqrt(T))
+    
+    # Vega (same for Call/Put) -> Change in price per 1% change in IV
+    # Usually Vega is shown as * 0.01 (impact of 1% change)
+    vega = S * np.sqrt(T) * pdf_d1 * 0.01
+
+    # Daily Theta (approx)
+    theta_daily = theta_annual / 365.0
+
+    return {
+        "delta": round(delta, 3),
+        "gamma": round(gamma, 5),
+        "theta": round(theta_daily, 2), # Daily Theta
+        "vega": round(vega, 2)
+    }
+
+def get_implied_volatility(market_price, S, K, T, r, option_type="CE", tol=0.001, max_iter=100):
+    """
+    Calculates Implied Volatility using Newton-Raphson method.
+    """
+    if market_price <= 0 or S <= 0 or K <= 0 or T <= 0:
+        return 0
+
+    sigma = 0.3 # Initial guess (30%)
+    
+    for i in range(max_iter):
+        # Calculate Price and Vega
+        greeks = get_greeks(S, K, T, r, sigma, option_type)
+        
+        # We need the theoretical price, not just delta/theta.
+        # Let's re-implement price func or extract it.
+        # For efficiency, let's keep it inline or add bs_price func.
+        
+        d1, d2 = d1_d2(S, K, T, r, sigma)
+        if option_type == "CE":
+            theo_price = S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
+        else:
+            theo_price = K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
+            
+        diff = theo_price - market_price
+        
+        if abs(diff) < tol:
+            return round(sigma * 100, 2) # Return as percentage (e.g. 15.5)
+            
+        vega = S * np.sqrt(T) * norm.pdf(d1)
+        if vega == 0:
+            break
+            
+        sigma = sigma - diff / vega
+        
+    return round(sigma * 100, 2)
+
+def calculate_time_to_expiry(expiry_date):
+    """
+    Returns T (years) from a dict or datetime.
+    """
+    if isinstance(expiry_date, str):
+         # Try parsing YYYY-MM-DD
+         try:
+             expiry_date = datetime.datetime.strptime(expiry_date, "%Y-%m-%d").date()
+         except:
+             return 0
+
+    now = datetime.datetime.now()
+    if isinstance(expiry_date, datetime.date) and not isinstance(expiry_date, datetime.datetime):
+         # Convert to datetime at market close (15:30) for precision?
+         # Or just use midnight
+         expiry_dt = datetime.datetime.combine(expiry_date, datetime.time(15, 30))
+    else:
+         expiry_dt = expiry_date
+         
+    diff = expiry_dt - now
+    days = diff.days
+    seconds = diff.seconds
+    total_years = (days + seconds / 86400.0) / 365.0
+    return max(0, total_years)
+
+if __name__ == "__main__":
+    # Test
+    S = 21500
+    K = 21600
+    T = 5/365 # 5 days
+    r = 0.07
+    sigma = 0.15 # 15%
+    
+    print(f"Call Greeks: {get_greeks(S, K, T, r, sigma, 'CE')}")
+    print(f"Put Greeks: {get_greeks(S, K, T, r, sigma, 'PE')}")
+
+
+--- FILE: hedging_engine.py ---
+
+import margin_engine
+
+def get_hedged_strategy(view, capital, margin, symbol, expiry_data, atm_strike):
+    """
+    Suggests a hedged strategy based on view and capital.
+    Ideal for margin 20k-40k where naked selling is risky/impossible but Buying is too volatile.
+    """
+    
+    strategy = {}
+    
+    # Vertical Spreads (Debit or Credit)
+    # Low Capital/Margin -> Debit Spread (Buy ATM, Sell OTM) -> Reduces cost
+    # Mid Capital -> Credit Spread (Sell OTM, Buy Further OTM) -> Income
+    
+    if view == "BULLISH":
+        if margin > 25000:
+            # Bull Put Spread (Credit) - Moderately Bullish
+            # Sell PE (ATM/OTM), Buy PE (Lower Strike)
+            strategy = {
+                "name": "Bull Put Spread (Credit)",
+                "legs": [
+                    {"action": "SELL", "type": "PE", "strike": atm_strike, "quantity": 1}, # Sell ATM/OTM
+                    {"action": "BUY", "type": "PE", "strike": atm_strike - 200, "quantity": 1} # Buy Hedge
+                ],
+                "reason": "Credit spread to benefit from sideways-to-up move."
+            }
+        else:
+            # Bull Call Spread (Debit) - Directional
+            # Buy CE (ATM), Sell CE (OTM)
+            strategy = {
+                "name": "Bull Call Spread (Debit)",
+                "legs": [
+                    {"action": "BUY", "type": "CE", "strike": atm_strike, "quantity": 1},
+                    {"action": "SELL", "type": "CE", "strike": atm_strike + 200, "quantity": 1} # Reduce cost
+                ],
+                "reason": "Debit spread to reduce premium cost and theta decay."
+            }
+            
+    elif view == "BEARISH":
+        if margin > 25000:
+            # Bear Call Spread (Credit)
+            strategy = {
+                "name": "Bear Call Spread (Credit)",
+                "legs": [
+                    {"action": "SELL", "type": "CE", "strike": atm_strike, "quantity": 1},
+                    {"action": "BUY", "type": "CE", "strike": atm_strike + 200, "quantity": 1}
+                ],
+                "reason": "Credit spread to benefit from sideways-to-down move."
+            }
+        else:
+            # Bear Put Spread (Debit)
+            strategy = {
+                "name": "Bear Put Spread (Debit)",
+                "legs": [
+                    {"action": "BUY", "type": "PE", "strike": atm_strike, "quantity": 1},
+                    {"action": "SELL", "type": "PE", "strike": atm_strike - 200, "quantity": 1}
+                ],
+                "reason": "Debit spread to reduce premium cost."
+            }
+            
+    else:
+        # Sideways
+        if margin > 40000:
+             strategy = {
+                "name": "Iron Condor",
+                "legs": [
+                    {"action": "SELL", "type": "CE", "strike": atm_strike + 100, "quantity": 1},
+                    {"action": "BUY", "type": "CE", "strike": atm_strike + 300, "quantity": 1},
+                    {"action": "SELL", "type": "PE", "strike": atm_strike - 100, "quantity": 1},
+                    {"action": "BUY", "type": "PE", "strike": atm_strike - 300, "quantity": 1},
+                ],
+                "reason": "Non-directional strategy to eat theta."
+            }
+        else:
+             strategy = {"name": "WAIT", "legs": [], "reason": "Sideways market, insufficient capital for Iron Condor."}
+             
+    return strategy
+
+
+--- FILE: kite_data.py ---
+
+from kiteconnect import KiteConnect
+import config
+import logging
+
+# Logger
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("KiteData")
+
+_kite = None
+
+def get_kite():
+    global _kite
+    if _kite is None:
+        try:
+            _kite = KiteConnect(api_key=config.API_KEY)
+            _kite.set_access_token(config.ACCESS_TOKEN)
+        except Exception as e:
+            logger.error(f"Error initializing Kite: {e}")
+    return _kite
+
+# --- 1. INDEX TOKENS (FIX SPOT PRICE SOURCE) ---
+INDEX_TOKENS = {
+    "NIFTY": 256265,
+    "BANKNIFTY": 260105,
+    "FINNIFTY": 257801
+}
+
+# --- 2. ADD OPTION TOKEN LOOKUP (MANDATORY) ---
+OPTION_TOKENS = {}
+# Global cache for lot sizes (Underlying -> Lot Size)
+LOT_SIZE_CACHE = {}
+# Global cache for Instrument Details (Symbol -> {expiry, strike, lot_size})
+INSTRUMENT_DETAILS = {}
+
+def load_option_tokens(kite):
+    global LOT_SIZE_CACHE, INSTRUMENT_DETAILS
+    tokens = {}
+    print("[*] Loading Option Tokens & Lot Sizes... (This may take a moment)")
+    try:
+        # Fetch detailed instrument list for NFO
+        instruments = kite.instruments("NFO")
+        for inst in instruments:
+            ts = inst["tradingsymbol"]
+            tokens[ts] = inst["instrument_token"]
+            
+            # Map Underlying Name to Lot Size (Prefer NFO-OPT)
+            if inst["segment"] in ["NFO-OPT", "NFO-FUT"]:
+                 LOT_SIZE_CACHE[inst["name"]] = inst["lot_size"]
+                 
+            # Cache Details for Greeks
+            INSTRUMENT_DETAILS[ts] = {
+                "expiry": inst["expiry"],
+                "strike": inst["strike"],
+                "name": inst["name"],
+                "lot_size": inst["lot_size"]
+            }
+                 
+        print(f"[*] Loaded {len(tokens)} Option Tokens.")
+        print(f"[*] Loaded {len(LOT_SIZE_CACHE)} Lot Size entries.")
+    except Exception as e:
+        print(f"[!] Error loading tokens: {e}")
+    return tokens
+
+def get_instrument_detail(symbol):
+    return INSTRUMENT_DETAILS.get(symbol, {})
+
+def get_cached_lot_size(name):
+     return LOT_SIZE_CACHE.get(name, None)
+
+def ensure_tokens_loaded(kite):
+    global OPTION_TOKENS
+    if not OPTION_TOKENS:
+        OPTION_TOKENS = load_option_tokens(kite)
+
+# --- 3. FIX LTP FETCHING (STRICT - NO FALLBACKS) ---
+def get_ltp(symbol, kite):
+    
+    # Check if it's an Index and return spot from token
+    if symbol in INDEX_TOKENS:
+        try:
+            token = INDEX_TOKENS[symbol]
+            data = kite.ltp(token)
+            return data[str(token)]["last_price"]
+        except Exception as e:
+            print(f"Error fetching Index Spot {symbol}: {e}")
+            return None
+
+    # Token Check for Options
+    ensure_tokens_loaded(kite)
+    
+    # Identify Tradingsymbol (remove NFO: prefix if present)
+    tradingsymbol = symbol.replace("NFO:", "")
+    
+    # Check if this looks like an option (not index) to validate token
+    if "NFO:" in symbol or any(x in symbol for x in ["CE", "PE", "FUT"]):
+        # It's an NFO instrument. Validate token exists first?
+        # Actually, let's just ensure we pass "NFO:" to kite.ltp if it's missing
+        if not symbol.startswith("NFO:"):
+             symbol = "NFO:" + symbol
+             
+        if tradingsymbol not in OPTION_TOKENS:
+            print(f"Token not found: {tradingsymbol}")
+            # If token not found in our cache, we might still try fetching?
+            # But let's trust the cache for now or just log warning.
+            # return None 
+    
+    try:
+        # 1. STRICT FETCH
+        data = kite.ltp(symbol)
+        
+        if symbol not in data:
+            return None
+            
+        ltp = data[symbol]["last_price"]
+        
+        # 2. FILTER INVALID PRICES
+        if ltp is None or ltp < 2:
+            print(f"Invalid or stale premium for {symbol} ({ltp}). Skipping.")
+            return None
+            
+        return ltp
+        
+    except Exception as e:
+        print("Error fetching LTP:", e)
+        return None
+
+# --- 4. REAL OPTION DATA (OI, IV, VOL) ---
+def get_real_option_data(symbol, kite):
+    """
+    Fetches comprehensive data including OI, Vol, IV, LTP.
+    """
+    ensure_tokens_loaded(kite)
+    
+    # Symbol formatting
+    if not symbol.startswith("NFO:"):
+        full_symbol = "NFO:" + symbol
+    else:
+        full_symbol = symbol
+        
+    try:
+        q = kite.quote(full_symbol)
+        if full_symbol not in q:
+            return None
+            
+        data = q[full_symbol]
+        return {
+            "ltp": data["last_price"],
+            "oi": data["oi"],
+            "volume": data["volume"],
+            "iv": data.get("iv", None) # Some quotes might not have IV
+        }
+    except Exception as e:
+        print(f"Error fetching real option data for {symbol}: {e}")
+        return None
+
+# Indices Token Map (For Historical Data wrapper if needed later)
+TOKEN_MAP = INDEX_TOKENS.copy()
+TOKEN_MAP.update({
+    "MIDCPNIFTY": 288009,
+    "RELIANCE": 738561,
+    "HDFCBANK": 341249,
+    "ICICIBANK": 1270529,
+    "SBIN": 779521,
+    "TCS": 2953217,
+    "INFY": 408065
+}) 
+
+def get_historical_data(symbol, interval="5m", days=30):
+    """
+    Fetches historical candles using Zerodha API.
+    """
+    kite = get_kite()
+    token = TOKEN_MAP.get(symbol)
+    
+    if not token:
+        print(f"[!] Historical data supported only for Nifty/BankNifty/FinNifty. No token for {symbol}")
+        return []
+    
+    try:
+        import datetime
+        to_date = datetime.datetime.now()
+        from_date = to_date - datetime.timedelta(days=days)
+        
+        z_interval = interval
+        if interval == "5m": z_interval = "5minute"
+        elif interval == "15m": z_interval = "15minute"
+        elif interval == "1H": z_interval = "60minute"
+        elif interval == "1d": z_interval = "day"
+        
+        candles = kite.historical_data(token, from_date, to_date, z_interval)
+        return candles
+        
+    except Exception as e:
+        print(f"Error fetching Zerodha history for {symbol}: {e}")
+        return []
+
+# ------------------------------------------------------------------------
+# 🔥 1️⃣ REAL OPTION CHAIN FETCHER
+# ------------------------------------------------------------------------
+def fetch_option_chain(kite, underlying):
+    """
+    Fetches ALL live option-chain instruments.
+    """
+    # Normalize underlying name for regex/match
+    # User said "inst['name'] == underlying"
+    # Kite instruments usually have 'name' as 'NIFTY', 'BANKNIFTY', 'RELIANCE', etc.
+    print(f"[*] Fetching Option Chain for {underlying}...")
+    try:
+        instruments = kite.instruments("NFO")
+        chain = []
+        for inst in instruments:
+            if inst["name"] == underlying and inst["segment"] == "NFO-OPT":
+                chain.append(inst)
+        return chain
+    except Exception as e:
+        print(f"Error fetching option chain: {e}")
+        return []
+
+# ------------------------------------------------------------------------
+# 🔥 4️⃣ REAL IV FETCH
+# ------------------------------------------------------------------------
+def get_iv_value(kite, symbol):
+    """
+    Fetches real IV from Quote.
+    """
+    if not symbol.startswith("NFO:"): symbol = "NFO:" + symbol
+    try:
+        q = kite.quote(symbol)
+        data = q.get(symbol, {})
+        iv = data.get("iv", None)
+        
+        if iv is not None and iv > 0:
+            return iv
+            
+        # API IV missing, calculate it manually
+        # specific to options
+        import greeks_engine
+        
+        ltp = data.get('last_price', 0)
+        ts = symbol.replace("NFO:", "")
+        details = INSTRUMENT_DETAILS.get(ts)
+        
+        # We need details (Strike, Expiry)
+        # If details are not in cache, we cannot calc IV easily without fetching instrument master again or parsing symbol
+        # Assuming load_option_tokens ran earlier or we lazily fetch
+        if not details:
+            # Try to get spot for fallback
+            # This is complex without details. Return 0 for now to avoid crashes.
+            return 0
+            
+        # Get Underlying Spot
+        underlying = details['name'] # e.g. NIFTY
+        idx_token = INDEX_TOKENS.get(underlying)
+        S = 0
+        if idx_token:
+             # We need to fetch spot ltp? We might have just quoted options
+             # To save calls, we could use cached spot or just fetch it.
+             # Ideally get_iv_value should be efficient.
+             # Let's assume we can fetch it.
+             try:
+                 qs = kite.ltp(idx_token)
+                 S = qs[str(idx_token)]['last_price']
+             except: return 0
+        else:
+            return 0 # Cannot find spot
+            
+        K = details['strike']
+        T = greeks_engine.calculate_time_to_expiry(details['expiry'])
+        opt_type = "CE" if "CE" in ts else "PE"
+        
+        calc_iv = greeks_engine.get_implied_volatility(ltp, S, K, T, 0.07, opt_type)
+        return calc_iv
+
+    except Exception as e:
+        # print(f"Error getting IV: {e}")
+        return None
+
+# ------------------------------------------------------------------------
+# 🔥 6️⃣ REAL LIQUIDITY FILTER
+# ------------------------------------------------------------------------
+def valid_liquidity(kite, symbol):
+    """
+    Strict Liquidity Check:
+    - Volume >= 5000
+    - OI >= 10000
+    - LTP >= 2
+    """
+    if not symbol.startswith("NFO:"): symbol = "NFO:" + symbol
+    try:
+        q = kite.quote(symbol)
+        data = q.get(symbol, {})
+
+        volume = data.get("volume", 0)
+        oi = data.get("oi", 0)
+        ltp = data.get("last_price", 0)
+        
+        # print(f"Checking {symbol}: Vol={volume}, OI={oi}, LTP={ltp}")
+
+        if volume < 5000: return False
+        if oi < 10000: return False
+        if ltp < 2: return False
+
+        return True
+    except Exception as e:
+        # print(f"Error validating liquidity: {e}")
+        return False
+
+
+--- FILE: kite_login.py ---
+
+import logging
+from kiteconnect import KiteConnect
+import config
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+
+def get_login_url():
+    kite = KiteConnect(api_key=config.API_KEY)
+    return kite.login_url()
+
+def generate_access_token(request_token):
+    try:
+        kite = KiteConnect(api_key=config.API_KEY)
+        data = kite.generate_session(request_token, api_secret=config.API_SECRET)
+        access_token = data["access_token"]
+        print(f"Success! Access Token: {access_token}")
+        
+        # Save to config.py
+        update_config_file(access_token)
+        return access_token
+    except Exception as e:
+        print(f"Error generating token: {e}")
+        return None
+
+def update_config_file(new_token):
+    # Read the current config file
+    with open("config.py", "r") as f:
+        lines = f.readlines()
+    
+    # Update the ACCESS_TOKEN line
+    with open("config.py", "w") as f:
+        for line in lines:
+            if line.startswith("ACCESS_TOKEN"):
+                f.write(f'ACCESS_TOKEN = "{new_token}"\n')
+            else:
+                f.write(line)
+    print("Updated config.py with new Access Token.")
+
+if __name__ == "__main__":
+    print("--- Zerodha Login Manager ---")
+    print(f"1. Login URL: {get_login_url()}")
+    
+    req_token = input("\nEnter the 'request_token' from the Redirect URL: ").strip()
+    if req_token:
+        generate_access_token(req_token)
+
+
+--- FILE: logger.py ---
+
+class TelegramLogger:
+    def __init__(self):
+        self.logs = []
+
+    def log(self, message):
+        """
+        Prints to console and appends to the internal log list.
+        """
+        print(message)
+        self.logs.append(str(message))
+
+    def get_logs(self):
+        """
+        Returns the accumulated logs as a single string.
+        """
+        return "\n".join(self.logs)
+
+    def clear(self):
+        """
+        Clears the accumulated logs.
+        """
+        self.logs = []
+
+
+--- FILE: lot_engine.py ---
+
+# Lot Sizes logic updated to fetch properly from Zerodha
+import kite_data
+
+# Fallback Lot Sizes (only used if API fetch fails)
+FALLBACK_LOT_SIZES = {
+    "NIFTY": 50,
+    "BANKNIFTY": 15,
+    "FINNIFTY": 40,
+    "MIDCPNIFTY": 75,
+    "RELIANCE": 250,
+    "HDFCBANK": 550,
+    "INFY": 400,
+    "TCS": 175,
+    "ICICIBANK": 700,
+    "SBIN": 1500,
+    "TATAMOTORS": 1425,
+    "AXISBANK": 625,
+    "KOTAKBANK": 400,
+    "LT": 300,
+    "BAJFINANCE": 125,
+    "MARUTI": 100
+}
+
+def get_lot_size(symbol):
+    # Normalize inputs like "Nifty Bank", "NIFTY 50" to "BANKNIFTY", "NIFTY"
+    s = symbol.upper().replace("NSE:", "").replace("NIFTY 50", "NIFTY").replace("NIFTY BANK", "BANKNIFTY")
+    
+    # 1. Try to get dynamic lot size from kite_data (populated at startup)
+    dynamic_lot = kite_data.get_cached_lot_size(s)
+    if dynamic_lot:
+        return dynamic_lot
+        
+    # 2. If not found (maybe kite not loaded yet?), force load/check
+    # Note: ensure_tokens_loaded calls load_option_tokens which populates the cache
+    if kite_data.get_kite(): 
+        kite_data.ensure_tokens_loaded(kite_data.get_kite())
+        dynamic_lot = kite_data.get_cached_lot_size(s)
+        if dynamic_lot:
+            return dynamic_lot
+
+    # 3. Fallback
+    print(f"[!] Warning: Using fallback lot size for {s}")
+    return FALLBACK_LOT_SIZES.get(s, 1) # Default to 1 if not found (Equity)
+
+
+--- FILE: main.py ---
+
+from suggestion_engine import suggest_trade
+import kite_data
+import market_regime_engine
+import greeks_engine
+import datetime
+import time
+
+# ------------------------------------------------------------------------
+# HOLD-TIME RECOMMENDATION ENGINE
+# ------------------------------------------------------------------------
+class HoldTimeAdvisor:
+    def __init__(self):
+        self.kite = kite_data.get_kite()
+        # Cache for order times to avoid repetitive API calls
+        self.entry_time_cache = {} 
+        
+    def get_entry_time(self, symbol):
+        """
+        Attempts to find the latest filled order time for this symbol.
+        """
+        if symbol in self.entry_time_cache:
+            return self.entry_time_cache[symbol]
+            
+        try:
+            orders = self.kite.orders()
+            # Sort by time desc
+            # Find last COMPLETED order for this symbol
+            for o in reversed(orders):
+                if o['tradingsymbol'] == symbol and o['status'] == 'COMPLETE':
+                    # Store as object
+                    limit_time = o['order_timestamp']
+                    self.entry_time_cache[symbol] = limit_time
+                    return limit_time
+        except Exception as e:
+            print(f"[!] Error fetching orders: {e}")
+            
+        return None
+
+    def analyze_position(self, pos):
+        """
+        Analyzes a SINGLE position for Time-based guidance.
+        """
+        symbol = pos['tradingsymbol']
+        qty = pos['quantity']
+        
+        # 1. Determine Time Held
+        entry_time = self.get_entry_time(symbol)
+        time_held_min = 0
+        if entry_time:
+            now = datetime.datetime.now(entry_time.tzinfo) # Match timezone
+            diff = now - entry_time
+            time_held_min = int(diff.total_seconds() / 60)
+        else:
+            # Fallback if no order found (e.g. carried over)
+             pass 
+
+        # 2. Market Context
+        # Determine Underlying
+        underlying = "NIFTY"
+        if "BANKNIFTY" in symbol: underlying = "BANKNIFTY"
+        elif "FINNIFTY" in symbol: underlying = "FINNIFTY"
+        
+        regime = market_regime_engine.get_market_regime(underlying)
+        
+        # 3. Base Patience Window
+        # TREND: 60-90m, VOLATILE: 30-45m, RANGE: 15-25m
+        base_patience = 25 # Default (RANGE)
+        if "TREND" in regime: base_patience = 75 # Avg of 60-90
+        elif "VOLATILE" in regime: base_patience = 40
+        else: base_patience = 20
+        
+        # 4. Adjustments
+        adjustments = []
+        patience_score = 0
+        
+        # A. Greeks Logic
+        details = kite_data.get_instrument_detail(symbol)
+        greeks = {}
+        if details:
+            S = kite_data.get_ltp(underlying, self.kite) or 0
+            K = details.get("strike", 0)
+            T = greeks_engine.calculate_time_to_expiry(details.get("expiry"))
+            sigma = kite_data.get_iv_value(self.kite, symbol)
+            if not sigma: sigma = 20
+            sigma = sigma / 100.0
+            
+            option_type = "CE" if "CE" in symbol else "PE"
+            greeks = greeks_engine.get_greeks(S, K, T, 0.07, sigma, option_type)
+            
+            # Theta Adjustment:
+            # If Theta is high (near expiry), reduce patience
+            theta = greeks.get('theta', 0)
+            if abs(theta) > 15: # Arbitrary high decay
+                patience_score -= 15
+                adjustments.append(f"High Theta Decay ({theta:.1f})")
+            
+            # Delta Adjustment:
+            # If Delta is moving in favor (Spot Progress), increase patience
+            # We assume current PnL reflects this roughly or check underlying trend
+            delta = greeks.get('delta', 0)
+            is_long = qty > 0
+            
+            # Spot Trend Check
+            u_ltp = S
+            # We don't have entry spot easily unless we cached it. 
+            # We rely on Regime.
+            if is_long:
+                 if ("UP" in regime and "CE" in symbol) or ("DOWN" in regime and "PE" in symbol):
+                     patience_score += 20
+                     adjustments.append("Trend Supports Position")
+                 elif regime == "SIDEWAYS":
+                     patience_score -= 10
+                     adjustments.append("Sideways Market (Decay Risk)")
+        
+        # B. DTE Check
+        # If DTE < 1, urgency is max
+        # Extract DTE from symbol or cached details?
+        pass # Simplified for now
+        
+        # 5. Calculate Final Recommended Hold Time
+        recommended = base_patience + patience_score
+        # Clamp
+        recommended = max(10, min(recommended, 120))
+        
+        remaining = recommended - time_held_min
+        
+        confidence = "HIGH"
+        if remaining < 0: confidence = "LOW"
+        elif remaining < 15: confidence = "MEDIUM"
+        
+        # 6. OVERNIGHT CARRY DECISION
+        # Inputs: Regime, PnL (Spot Progress approx), DTE, Theta
+        overnight_decision = "AVOID OVERNIGHT"
+        overnight_reason = "General Risk Aversion"
+        overnight_conditions = ""
+        
+        # Calculate approximate PnL % for Spot Progress check
+        # (LTP - Avg) / Avg
+        try:
+            current_pnl_pct = ((kite_data.get_ltp(symbol, self.kite) - pos['average_price']) / pos['average_price']) * 100
+            if qty < 0: current_pnl_pct *= -1 # Invert for shorts
+        except:
+            current_pnl_pct = 0
+            
+        dfe = 0 # Days from Expiry
+        if details:
+             dfe = greeks_engine.calculate_time_to_expiry(details.get("expiry")) * 365
+        
+        # LOGIC MATRIX
+        safe_regime = ("TRENDING" in regime)
+        safe_pnl = (current_pnl_pct > 1.0) # At least 1% buffer
+        safe_dte = (dfe >= 2.0) # Not expiring tomorrow/today
+        
+        if not safe_dte:
+            overnight_decision = "AVOID OVERNIGHT"
+            overnight_reason = f"Expiry too close ({dfe:.1f} days). Gamma/Theta risk."
+        elif "SIDEWAYS" in regime:
+            overnight_decision = "AVOID OVERNIGHT"
+            overnight_reason = "Market is Sideways/Range-bound. Decay risk."
+        elif current_pnl_pct < -2.0:
+            overnight_decision = "AVOID OVERNIGHT"
+            overnight_reason = f"Negative PnL ({current_pnl_pct:.1f}%). Thesis failing."
+        else:
+            # Regime is Trending or Volatile, DTE is safe, PnL is decent or flat
+            if safe_regime and safe_pnl:
+                overnight_decision = "HOLD OVERNIGHT"
+                overnight_reason = f"Strong Regime ({regime}) + Profit Buffer ({current_pnl_pct:.1f}%)."
+            elif safe_regime and (current_pnl_pct > -2.0 and current_pnl_pct <= 1.0):
+                 overnight_decision = "CONDITIONAL HOLD"
+                 overnight_reason = "Trend exists but PnL buffer is thin."
+                 overnight_conditions = "Requires strong opening or Gap Up tomorrow."
+            else:
+                 # Default fallback
+                 overnight_decision = "CONDITIONAL HOLD"
+                 overnight_reason = "Mixed signals."
+                 overnight_conditions = "Verify Global cues before carry."
+
+        return {
+            "symbol": symbol,
+            "regime": regime,
+            "time_held": time_held_min,
+            "recommended_hold": recommended,
+            "remaining": remaining,
+            "confidence": confidence,
+            "adjustments": adjustments,
+            "overnight": {
+                "decision": overnight_decision,
+                "reason": overnight_reason,
+                "conditions": overnight_conditions
+            }
+        }
+
+    def run_report(self):
+        print("\n[*] Fetching Positions for Time Analysis...")
+        try:
+             positions = self.kite.positions()['net']
+        except:
+             print("[!] Error fetching positions.")
+             return
+
+        if not positions:
+            print("[i] No open positions.")
+            return
+
+        print("\n" + "="*60)
+        print(" ⏳ HOLD-TIME & OVERNIGHT ADVISOR")
+        print("="*60)
+        
+        for pos in positions:
+            if pos['quantity'] == 0: continue
+            # Filter options
+            if "CE" not in pos['tradingsymbol'] and "PE" not in pos['tradingsymbol']: continue
+            
+            res = self.analyze_position(pos)
+            
+            color = "\033[92m" # Green
+            if res['remaining'] < 5: color = "\033[91m" # Red
+            elif res['remaining'] < 15: color = "\033[93m" # Yellow
+            RESET = "\033[0m"
+            
+            print(f"Symbol: {res['symbol']}")
+            print(f"Regime: {res['regime']}")
+            print(f"Time Held: {res['time_held']}m")
+            print(f"{color}Intraday Hold: {res['recommended_hold']}m (Remaining: {res['remaining']}m){RESET}")
+            if res['adjustments']:
+                print(f"Notes: {', '.join(res['adjustments'])}")
+            
+            # Overnight Section
+            od = res['overnight']
+            ocolor = "\033[91m" # Red (Avoid)
+            if "HOLD" in od['decision']: ocolor = "\033[92m"
+            if "CONDITIONAL" in od['decision']: ocolor = "\033[93m"
+            
+            print(f"{ocolor}Overnight: {od['decision']}{RESET}")
+            print(f"   Reason: {od['reason']}")
+            if od['conditions']:
+                print(f"   Condition: \033[3m{od['conditions']}{RESET}")
+            print("-" * 40)
+
+# ------------------------------------------------------------------------
+# MAIN ENTRY
+# ------------------------------------------------------------------------
+def main():
+    print("\n--- ZERODHA ALGO TRADER ---")
+    while True:
+        print("\n1. Suggest New Trade (Scanner)")
+        print("2. Analyze Open Positions (Hold-Time Advisor)")
+        print("3. Exit")
+        
+        choice = input("Select Option: ")
+        
+        if choice == "1":
+            try:
+                capital = float(input("Enter Your Capital (INR): "))
+                margin = float(input("Enter Available Margin (INR): "))
+                suggest_trade(capital, margin)
+            except ValueError as e:
+                print(f"[!] Invalid input: {e}")
+        
+        elif choice == "2":
+            advisor = HoldTimeAdvisor()
+            advisor.run_report()
+            
+        elif choice == "3":
+            print("Exiting...")
+            break
+        else:
+            print("Invalid Choice.")
+            
+if __name__ == "__main__":
+    main()
+
+
+--- FILE: margin_engine.py ---
+
+def estimate_short_margin(symbol, strike, premium, lot_size=None):
+    """
+    Estimates margin required for a Short Option position.
+    Formula Estimation (Zerodha-ish):
+    Margin ~ Span + Exposure
+    Approx Rule of Thumb: 1.2 * Spot * LotSize * 0.20 (20% of contract value)
+    
+    This is a rough estimation. Real API call is needed for exact values.
+    """
+    # Defaults
+    if lot_size is None:
+        if "NIFTY" in symbol: lot_size = 50 if "BANK" not in symbol else 15
+        else: lot_size = 50 # Fallback
+        
+    # Spot proxy from strike (Rough)
+    spot_proxy = strike 
+    
+    # 20% of Contract Value (Standard Regulation)
+    estimated_margin = spot_proxy * lot_size * 0.20
+    
+    # Add buffer
+    return estimated_margin * 1.1
+
+def margin_allows_short(available_margin, required_margin):
+    return available_margin >= required_margin
+
+def choose_strategy_based_on_margin(margin, capital, intended_strategy_type="ANY"):
+    """
+    Filters allowed strategies based on Margin.
+    
+    Logic:
+    - Margin = 0: BUY ONLY.
+    - Margin < 10k: BUY ONLY (Safety).
+    - Margin 10k-30k: DEBIT SPREADS (Hedged Short allowed).
+    - Margin > 30k: SELL / SHORT STRADDLE allowed.
+    """
+    if margin <= 0:
+        return "BUY_ONLY"
+        
+    if margin < 10000:
+        return "BUY_ONLY"
+        
+    if 10000 <= margin < 30000:
+        return "SPREADS_ONLY"
+        
+    if margin >= 30000:
+        return "ALL_ALLOWED" # Selling allowed
+        
+    return "BUY_ONLY"
+
+
+--- FILE: market_regime_engine.py ---
+
+import pandas as pd
+import numpy as np
+import kite_data
+
+def get_market_regime(symbol="NIFTY"):
+    """
+    Analyzes the market regime using EMA, RSI, and ATR.
+    Returns: regime string ("TRENDING_UP", "TRENDING_DOWN", "SIDEWAYS", "VOLATILE", "SLOW")
+    """
+    try:
+        # Fetch Data via Kite (approx 3 months -> 90 days)
+        # Using "day" candles for longer term trend
+        candles = kite_data.get_historical_data(symbol, interval="1d", days=120)
+        
+        if not candles:
+            return "SIDEWAYS" # Fallback
+            
+        data = pd.DataFrame(candles)
+        
+        # Rename lower case to Title Case for consistency if needed, but Zerodha gives 'close'
+        # We need to standardize column names to: Close, High, Low, Open
+        data.rename(columns={'close': 'Close', 'high': 'High', 'low': 'Low', 'open': 'Open'}, inplace=True)
+        
+        # Indicators
+        data['EMA20'] = data['Close'].ewm(span=20).mean()
+        data['EMA50'] = data['Close'].ewm(span=50).mean()
+        
+        # RSI
+        delta = data['Close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+        rs = gain / loss
+        data['RSI'] = 100 - (100 / (1 + rs))
+        
+        # ATR (Vol proxy)
+        high_low = data['High'] - data['Low']
+        high_close = np.abs(data['High'] - data['Close'].shift())
+        low_close = np.abs(data['Low'] - data['Close'].shift())
+        ranges = pd.concat([high_low, high_close, low_close], axis=1)
+        true_range = np.max(ranges, axis=1)
+        data['ATR'] = true_range.rolling(14).mean()
+        
+        current = data.iloc[-1]
+        
+        # Logic
+        price = current['Close']
+        ema20 = current['EMA20']
+        ema50 = current['EMA50']
+        rsi = current['RSI']
+        atr = current['ATR']
+        avg_atr = data['ATR'].mean()
+        
+        # 1. Volatility Check
+        is_volatile = atr > (avg_atr * 1.3)
+        is_slow = atr < (avg_atr * 0.7)
+        
+        # 2. Trend Check
+        if price > ema20 > ema50:
+            if is_volatile: return "VOLATILE_UP"
+            return "TRENDING_UP"
+            
+        elif price < ema20 < ema50:
+            if is_volatile: return "VOLATILE_DOWN"
+            return "TRENDING_DOWN"
+            
+        else:
+            # Sideways or unclear
+            if is_volatile: return "VOLATILE"
+            if is_slow: return "SLOW"
+            return "SIDEWAYS"
+            
+    except Exception as e:
+        print(f"[Regime] Error: {e}")
+        return "SIDEWAYS" # Safe Fallback
+
+
+--- FILE: oi_analysis_engine.py ---
+
+import kite_data
+
+# ------------------------------------------------------------------------
+# 🔥 5️⃣ REAL IV RANK CALCULATION (In-Memory History)
+# ------------------------------------------------------------------------
+IV_HISTORY = {}
+
+def update_iv_history(symbol, iv):
+    if iv is None or iv == 0: return
+    if symbol not in IV_HISTORY:
+        IV_HISTORY[symbol] = []
+    IV_HISTORY[symbol].append(iv)
+    if len(IV_HISTORY[symbol]) > 200:
+        IV_HISTORY[symbol] = IV_HISTORY[symbol][-200:]
+
+def calculate_iv_rank(symbol):
+    hist = IV_HISTORY.get(symbol, [])
+    if len(hist) < 5: # Need at least some history
+        return 0 # Default low if no history
+    
+    iv_current = hist[-1]
+    iv_min = min(hist)
+    iv_max = max(hist)
+    
+    if iv_max == iv_min:
+        return 0
+        
+    return round(((iv_current - iv_min) / (iv_max - iv_min)) * 100, 1)
+
+# ------------------------------------------------------------------------
+# 🔥 2️⃣ REAL PCR (Put/Call Ratio) - BATCH FETCH
+# ------------------------------------------------------------------------
+def calculate_pcr(kite, underlying):
+    """
+    Calculates PCR using Real OI from ALL active options of the underlying.
+    Uses Batch Fetching to avoid Rate Limits.
+    """
+    if kite is None: kite = kite_data.get_kite()
+    
+    # 1. Get Chain
+    chain = kite_data.fetch_option_chain(kite, underlying)
+    if not chain: return 1.0
+    
+    # 2. Extract Tradingsymbols
+    # Filter for near expiry? Or use all?
+    # User said "ALL live option-chain instruments"
+    # But fetching 4000 symbols might be too much.
+    # Let's filter for current month expiry to be practical/safe?
+    # User said "Apply these changes ONLY", referencing their snippet.
+    # Their snippet iterates ALL. I should try to optimize batching.
+    
+    # We will fetch in batches of 500?
+    symbols = ["NFO:" + inst['tradingsymbol'] for inst in chain]
+    
+    total_put_oi = 0
+    total_call_oi = 0
+    
+    # Batch size for Quote API (Zerodha allows ~200-500 depending on app)
+    BATCH_SIZE = 250 
+    
+    for i in range(0, len(symbols), BATCH_SIZE):
+        batch = symbols[i:i+BATCH_SIZE]
+        try:
+            quotes = kite.quote(batch)
+            for sym, data in quotes.items():
+                oi = data.get('oi', 0)
+                if sym.endswith("PE"):
+                    total_put_oi += oi
+                elif sym.endswith("CE"):
+                    total_call_oi += oi
+        except Exception as e:
+            print(f"Error fetching batch PCR: {e}")
+            
+    if total_call_oi == 0:
+        return 1.0
+
+    return round(total_put_oi / total_call_oi, 2)
+
+# ------------------------------------------------------------------------
+# 🔥 3️⃣ REAL OI SIGNAL (Long/Short Buildup)
+# ------------------------------------------------------------------------
+def get_oi_delta(kite, symbol):
+    if not symbol.startswith("NFO:"): symbol = "NFO:" + symbol
+    try:
+        # Quote usually returns 'oi' and day's ohlc.
+        # But 'oi_day_low' is not standard in generic quote usually?
+        # User requested: "prev_oi = data.get('oi_day_low', 0)"
+        # Note: Zerodha quote actually has 'oi' and 'oi_day_high', 'oi_day_low'.
+        # If available, we use it.
+        q = kite.quote(symbol)
+        data = q.get(symbol, {})
+        oi = data.get("oi", 0)
+        # Assuming 'oi_day_low' exists or we use 'open_interest' diff logic if available.
+        # If 'oi_day_low' is not reliable proxy for "previous OI" (it's intraday low),
+        # then this logic detects intraday buildup from low.
+        prev_oi = data.get("oi_day_low", 0) 
+        
+        # Real Change: Usually we need close - prev_close.
+        # Here we use OI - Day Low as "Buildup".
+        return oi - prev_oi, data
+    except:
+        return 0, {}
+
+def interpret_oi_signal(price_change, oi_change):
+    if price_change > 0 and oi_change > 0:
+        return "LONG BUILDUP"
+    elif price_change < 0 and oi_change > 0:
+        return "SHORT BUILDUP"
+    elif price_change > 0 and oi_change < 0:
+        return "SHORT COVERING"
+    elif price_change < 0 and oi_change < 0:
+        return "LONG UNWINDING"
+    return "NEUTRAL"
+
+def get_market_sentiment(symbol, kite=None):
+    # Wrapper to be compatible with engine calls
+    if kite is None: kite = kite_data.get_kite()
+    
+    # We need to pick a representative symbol for OI Signal (e.g. ATM)
+    # This function was called in suggestion_engine for "OI Signal" display.
+    # We will return the PCR based sentiment here or Generic.
+    
+    # Actually, suggestion_engine calls:
+    # `pcr = oi_analysis_engine.calculate_pcr(kite, symbol)`
+    # `oi_sentiment = ...`
+    
+    # We will implement a specific "get_atm_sentiment"?
+    # Or just return "N/A" here and let suggestion engine do the specific option check?
+    # User's snippet showed `interpret_oi_signal` which takes changes.
+    # We will leave this helper for compatibility if needed, but strictly use new logic.
+    return "NEUTRAL"
+
+
+
+--- FILE: otm_engine.py ---
+
+import atm_engine
+import kite_data
+import position_sizing
+import expiry_engine
+
+def get_otm_strikes(atm, gap, option_type, count=5):
+    """
+    Returns a list of OTM strikes.
+    """
+    strikes = []
+    if option_type == "CE":
+         for i in range(1, count + 1):
+            strikes.append(atm + (i * gap))
+    else:
+         for i in range(1, count + 1):
+            strikes.append(atm - (i * gap))
+    return strikes
+
+def find_affordable_otm(capital, base_symbol, atm, expiry_data, opt_type, kite):
+    """
+    Finds the first OTM strike that allows buying at least 1 lot within capital.
+    Now uses strict 'kite' instance and 'expiry_engine' symbol builder.
+    """
+    # Determine Gap
+    gap = 100 if "BANKNIFTY" in base_symbol else 50
+    
+    strikes = get_otm_strikes(atm, gap, opt_type, count=5)
+    
+    print(f"    [OTM Search] Checking {strikes}...")
+    
+    expiry_date = expiry_data['date']
+    
+    for stk in strikes:
+        # Strict Symbol Construction
+        # NFO: prefix required for Kite LTP? 
+        # kite_data.get_ltp handles "NFO:" check, constructing it with "NFO:" is safer if kite_data expects it 
+        # or if we need it for trading.
+        # User's strict logic returned pure valid tradingsymbol "NIFTY24JAN...".
+        # kite_data.get_ltp takes "NIFTY24JAN..." or "NFO:NIFTY24JAN..."
+        # But kite.ltp expects "NFO:SYMBOL" usually? 
+        # Let's verify kite_data.get_ltp logic: "if symbol not in OPTION_TOKENS and 'NFO:' in symbol..."
+        # It implies it handles both?
+        # Standardize on passing "NFO:" + symbol to be safe for API calls.
+        
+        sym_base = expiry_engine.get_option_symbol(base_symbol, expiry_date, stk, opt_type)
+        sym = "NFO:" + sym_base
+        
+        # 🔥 6️⃣ REAL LIQUIDITY FILTER (Using kite_data helper)
+        if not kite_data.valid_liquidity(kite, sym):
+            print(f"       [Skip] Illiquid: {sym_base}")
+            continue
+
+        # If valid, check Affordability
+        ltp = kite_data.get_ltp(sym, kite)
+        
+        if ltp is None: continue
+
+        lots, qty, cost, rem = position_sizing.calculate_lot_size(capital, ltp, base_symbol)
+        
+        if lots >= 1:
+            return {
+                "strike": stk,
+                "symbol": sym,
+                "premium": ltp,
+                "lots": lots,
+                "qty": qty,
+                "cost": cost,
+                "rem": rem,
+                "is_fallback": False
+            }
+            
+    # Fallback to Deep OTM (Last resort)
+    deep_strike = strikes[-1] + gap
+    sym_base = expiry_engine.get_option_symbol(base_symbol, expiry_date, deep_strike, opt_type)
+    sym = "NFO:" + sym_base
+    
+    ltp = kite_data.get_ltp(sym, kite)
+    return {
+        "strike": deep_strike,
+        "symbol": sym,
+        "premium": ltp if ltp else 0.0,
+        "lots": 1, 
+        "qty": 50, # Mock qty if affordable logic fails
+        "cost": 0,
+        "rem": capital,
+        "is_fallback": True
+    }
+
+
+--- FILE: position_advisor_engine.py ---
+
+import kite_data
+import market_regime_engine
+import oi_analysis_engine
+import datetime
+import greeks_engine
+
+# ------------------------------------------------------------------------
+# CORE ADVISORY LOGIC
+# ------------------------------------------------------------------------
+
+def analyze_position(position_data, kite=None):
+    """
+    Analyzes a SINGLE position and returns an advisory dict.
+    
+    position_data expected format:
+    {
+        "tradingsymbol": "NIFTY24JAN21500CE",
+        "instrument_token": 123456,
+        "quantity": 50, (Positive=Long, Negative=Short)
+        "average_price": 100.0,
+        "product": "NRML"
+    }
+    """
+    if kite is None:
+        kite = kite_data.get_kite()
+
+    symbol = position_data["tradingsymbol"]
+    qty = position_data["quantity"]
+    avg_price = position_data["average_price"]
+    
+    # 1. basic Info
+    is_long = qty > 0
+    qty_abs = abs(qty)
+    
+    # Check underlying (NIFTY/BANKNIFTY) - simple heuristic
+    underlying = "NIFTY"
+    if "BANKNIFTY" in symbol: underlying = "BANKNIFTY"
+    elif "FINNIFTY" in symbol: underlying = "FINNIFTY"
+    
+    # Check Option Type
+    is_ce = "CE" in symbol
+    is_pe = "PE" in symbol
+    option_type = "CE" if is_ce else "PE"
+    
+    # 2. Fetch Live Data
+    ltp = kite_data.get_ltp(symbol, kite)
+    
+    # Handle Data Fetch Breakdown
+    if ltp is None or ltp == 0:
+        return {
+        "symbol": symbol,
+        "decision": "DATA_ERROR",
+        "confidence": "LOW",
+        "pnl_pct": 0.0,
+        "primary_reason": "Live Price Unavailable",
+        "supporting_factors": [],
+        "risk_flags": ["Could not fetch LTP."],
+        "ltp": 0
+    }
+
+    pnl = (ltp - avg_price) * qty
+    pnl_pct = 0
+    if avg_price > 0:
+        pnl_pct = ((ltp - avg_price) / avg_price) * 100 if is_long else ((avg_price - ltp) / avg_price) * 100
+
+    # 3. Market Context & Greeks
+    regime = market_regime_engine.get_market_regime(underlying)  # TRENDING_UP, TRENDING_DOWN, SIDEWAYS
+    
+    # Fetch Instrument Details for Greeks
+    details = kite_data.get_instrument_detail(symbol)
+    greeks = {}
+    
+    if details:
+        # We need underlying spot price
+        S = kite_data.get_ltp(underlying, kite) or 0
+        K = details.get("strike", 0)
+        expiry = details.get("expiry")
+        T = greeks_engine.calculate_time_to_expiry(expiry)
+        
+        # IV (Try to fetch real IV, else approx)
+        sigma = kite_data.get_iv_value(kite, symbol)
+        if not sigma or sigma == 0: sigma = 0.20 # Default fallback 20%
+        else: sigma = sigma / 100.0 # Convert to decimal
+        
+        greeks = greeks_engine.get_greeks(S, K, T, 0.07, sigma, option_type)
+        
+    # 4. Underlying Trend Check
+    u_ltp = kite_data.get_ltp(underlying, kite)
+    # oi_signal = oi_analysis_engine.interpret_oi_signal(..., ...) 
+    # For simplicity, we compare Regime.
+    
+    # 5. Volatility / IV
+    # iv = kite_data.get_iv_value(kite, symbol)
+    
+    # --- DECISION LOGIC ---
+    decision = "HOLD"
+    confidence = "MEDIUM"
+    reasons = []
+    risks = []
+    
+    # A. TREND CHECK
+    trend_aligned = False
+    if is_long:
+        if is_ce and "UP" in regime: trend_aligned = True
+        elif is_pe and "DOWN" in regime: trend_aligned = True
+    else: # Short
+        if is_ce and "DOWN" in regime: trend_aligned = True
+        elif is_pe and "UP" in regime: trend_aligned = True
+        elif regime == "SIDEWAYS": trend_aligned = True # Shorts like sideways
+
+    if trend_aligned:
+        reasons.append(f"Market Trend ({regime}) matches position.")
+    else:
+        risks.append(f"Market Trend ({regime}) opposes position.")
+
+    # B. PROFIT/LOSS CHECK
+    if pnl_pct < -15: # 15% Loss
+        decision = "CAUTION"
+        risks.append(f"High Drawdown: {pnl_pct:.1f}%")
+        if pnl_pct < -30:
+            decision = "EXIT"
+            risks.append("Stop Loss Threshold breached (-30%).")
+    elif pnl_pct > 20:
+        reasons.append(f"Healthy Profit: {pnl_pct:.1f}%")
+        
+    # C. TIME DECAY (Theta) Check (Updated with Real Greeks)
+    if is_long and greeks:
+        theta_cost = greeks.get('theta', 0) * qty_abs # Total money losing per day
+        # Heuristic: If Theta cost is > 5% of invested capital per day, it's risky
+        invested = avg_price * qty_abs
+        if invested > 0 and abs(theta_cost) > (invested * 0.05):
+             risks.append(f"High Theta Decay: Losing ₹{abs(theta_cost):.0f}/day")
+             if "SIDEWAYS" in regime:
+                 decision = "CAUTION" if decision != "EXIT" else "EXIT"
+                 risks.append("Decay Risk accelerated by Sideways Market.")
+    # Original Theta Decay Check (if no greeks)
+    elif is_long and "SIDEWAYS" in regime:
+        decision = "CAUTION" if decision != "EXIT" else "EXIT"
+        risks.append("Theta Decay Risk (Long in Sideways Market).")
+
+    # D. CONTRARIAN EXIT (Trend Reversal)
+    if is_long and is_ce and "DOWN" in regime:
+        decision = "EXIT"
+        risks.append("Trend Reversed to DOWN.")
+    if is_long and is_pe and "UP" in regime:
+        decision = "EXIT"
+        risks.append("Trend Reversed to UP.")
+    
+    # E. THESIS FAILURE (Delta)
+    if is_long and greeks:
+        delta = greeks.get('delta', 0)
+        # If Delta is extremely low (Far OTM), report typical lottery ticket status
+        if abs(delta) < 0.15 and pnl_pct < 0:
+             risks.append("Position is Far OTM (Low Delta).")
+             decision = "CAUTION"
+
+    # F. Final Arbitrage
+    # If already set to EXIT, stick to it.
+    if decision == "EXIT":
+        confidence = "HIGH"
+    elif decision == "CAUTION":
+        confidence = "MEDIUM"
+    else:
+        # HOLD
+        if trend_aligned and pnl_pct > -5:
+            confidence = "HIGH"
+        else:
+            confidence = "LOW"
+            
+    # Logic Refinement: If EXIT/CAUTION, the "Primary Reason" should be the Risk, not the Trend.
+    final_primary_reason = "Monitoring..."
+    if decision in ["EXIT", "CAUTION"] and risks:
+        final_primary_reason = risks[0] # The main reason for the warning/exit
+    elif reasons:
+        final_primary_reason = reasons[0]
+
+    result = {
+        "symbol": symbol,
+        "decision": decision,
+        "confidence": confidence,
+        "pnl_pct": round(pnl_pct, 1),
+        "primary_reason": final_primary_reason,
+        "supporting_factors": reasons,
+        "risk_flags": risks,
+        "ltp": ltp
+    }
+    
+    if greeks:
+        result["greeks"] = greeks
+        
+    return result
+
+def get_advice_report(kite=None, positions=None):
+    """
+    Generates a full text report for all positions.
+    """
+    if not positions:
+        return "No open positions to analyze."
+        
+    report = ["🛡️ **Position Advisor Report**"]
+    
+    for pos in positions:
+        # Filter for Options/Futures only (ignore equity holdings for now if mixed)
+        if "CE" not in pos['tradingsymbol'] and "PE" not in pos['tradingsymbol'] and "FUT" not in pos['tradingsymbol']:
+             continue
+             
+        advice = analyze_position(pos, kite)
+        
+        icon = "🟢" if advice['decision'] == "HOLD" else "Mj" if advice['decision'] == "CAUTION" else "🔴"
+        if advice['decision'] == "CAUTION": icon = "⚠️"
+        if advice['decision'] == "DATA_ERROR": icon = "❓"
+        
+        block = [
+            f"{icon} **{advice['decision']}** | {pos['tradingsymbol']}",
+            f"   PnL: {advice['pnl_pct']}% | Conf: {advice['confidence']}",
+            f"   Reason: {advice['primary_reason']}"
+        ]
+        
+        # Add Greeks info if available
+        if "greeks" in advice:
+             g = advice["greeks"]
+             block.append(f"   📊 Greeks: Δ {g['delta']:.2f} | Θ {g['theta']:.2f}")
+             
+        if advice['risk_flags']:
+            # Make risks cleaner
+            for r in advice['risk_flags']:
+                block.append(f"   🚩 {r}")
+            
+        report.append("\n".join(block))
+        
+    return "\n\n".join(report)
+
+if __name__ == "__main__":
+    print("--- Position Advisor Engine (Real Data Run) ---")
+    
+    try:
+        # 1. Initialize Real Kite
+        print("[*] Initializing Kite Session from config...")
+        kite = kite_data.get_kite()
+        
+        if not kite:
+            print("❌ Failed to initialize Kite. Check config.py credentials.")
+            exit()
+            
+        # 2. Fetch Real Positions
+        print("[*] Fetching Open Positions...")
+        # Note: We need the full boolean or dict. 
+        # kite.positions() returns {'net': [...], 'day': [...]}
+        positions = kite.positions()['net']
+        
+        if not positions:
+            print("ℹ️ No open positions found (Net). checking Day positions...")
+            positions = kite.positions()['day']
+            
+        if not positions:
+            print("Message: No active positions found in your account.")
+        else:
+            print(f"[*] Found {len(positions)} positions. Analyzing...\n")
+            
+            # 3. Analyze
+            # We iterate and print detailed individual analysis or just the report
+            print("="*60)
+            print(get_advice_report(kite, positions))
+            print("="*60)
+            
+    except Exception as e:
+        print(f"❌ Error running with real data: {e}")
+        print("Tip: Ensure your ACCESS_TOKEN in config.py is valid and active.")
+
+
+--- FILE: position_sizing.py ---
+
+import math
+import lot_engine
+
+def calculate_lot_size(capital, premium, symbol):
+    """
+    Calculates how many lots to buy based on capital.
+    Returns (lots, total_qty, total_cost, rem_capital)
+    """
+    lot_size = lot_engine.get_lot_size(symbol)
+    
+    cost_per_lot = premium * lot_size
+    
+    if cost_per_lot == 0:
+        return 0, 0, 0, capital
+
+    # Max lots affordable
+    max_lots = math.floor(capital / cost_per_lot)
+    
+    total_qty = max_lots * lot_size
+    total_cost = max_lots * cost_per_lot
+    remaining_capital = capital - total_cost
+    
+    return max_lots, total_qty, total_cost, remaining_capital
+
+def get_risk_reward(premium):
+    """
+    --- 5. FIX STOPLOSS & TARGET CALCULATION ---
+    SL = entry_price * 0.80       # 20% stoploss
+    TARGET = entry_price * 1.30   # 30% target
+    """
+    sl_price = round(premium * 0.80, 2)
+    target_price = round(premium * 1.30, 2)
+    
+    risk = round(premium - sl_price, 2)
+    reward = round(target_price - premium, 2)
+    
+    return sl_price, target_price, risk, reward
+
+
+--- FILE: README.md ---
+
+# Options-
+
+
+--- FILE: requirements.txt ---
+
+numpy
+scipy
+python-dotenv
+requests
+logzero
+websocket-client
+kiteconnect
+python-telegram-bot
+
+
+--- FILE: run_bot.py ---
+
+import sys
+import telegram_interface
+
+def run():
+    print("--- ZERODHA TRADING BOT (TELEGRAM CONTROLLED) ---")
+    print("[-] Bot listener starting...")
+    print("[-] Open your Telegram App and use:")
+    print("    /scan  - to Run Analysis")
+    print("    /auto  - to Start Loop")
+    print("    /start - for Help")
+    
+    try:
+        # We just run the polling in the main thread now, no need for background threads
+        # since we don't have a console input loop anymore.
+        telegram_interface.run_telegram_bot()
+    except KeyboardInterrupt:
+        print("\n[!] Stopping Bot...")
+        sys.exit(0)
+    except Exception as e:
+        print(f"[!] Error: {e}")
+
+if __name__ == "__main__":
+    run()
+
+
+--- FILE: strategy.py ---
+
+from datetime import datetime
+import config
+from utils import logger
+
+class ShortStraddleStrategy:
+    def __init__(self, broker, risk_manager):
+        self.broker = broker
+        self.risk_manager = risk_manager
+        self.state = "WAITING" # WAITING, IN_POSITION, COMPLETED
+        self.positions = {} # {symbol: {'entry_price': x, 'sl': y, 'target': z, 'qty': q}}
+        self.pnl_locked = 0.0
+
+    def get_atm_strike(self, spot_price, step=50):
+        return round(spot_price / step) * step
+
+    def execute(self):
+        now = datetime.now()
+        current_time_str = now.strftime("%H:%M")
+
+        if self.state == "WAITING":
+            # If Mock mode, we might want to trigger immediately for testing
+            if config.USE_MOCK_BROKER or current_time_str == config.STRATEGY_TIME:
+                self.enter_positions()
+        
+        elif self.state == "IN_POSITION":
+            self.monitor_positions()
+            
+            # End of day exit (e.g., 15:15)
+            if current_time_str >= "15:15":
+                self.exit_all_positions("EOD Exit")
+
+    def enter_positions(self):
+        logger.info("Strategy Triggered: 9:20 Short Straddle")
+        
+        # Get Nifty Spot Price (Symbol token for Nifty 50 might vary, using dummy logic or broker call)
+        # Note: Implement get_ltp accordingly. Assuming "NIFTY" works or we pass token.
+        # Here we mock for logic flow or assume broker handles name resolution
+        nifty_ltp = self.broker.get_ltp("NSE", "99926000", "Nifty 50") # Example token
+        
+        if not nifty_ltp:
+            logger.error("Could not fetch Nifty Spot. Strategy Aborted.")
+            return
+
+        atm_strike = self.get_atm_strike(nifty_ltp)
+        logger.info(f"Nifty Spot: {nifty_ltp}, ATM Strike: {atm_strike}")
+
+        # Construct Symbols (Pseudo-code logic for symbol construction)
+        # In real API you need to lookup tokens for "NIFTY 24JAN26 21000 CE"
+        # We will assume we found them
+        ce_symbol = f"NIFTY {atm_strike} CE" 
+        pe_symbol = f"NIFTY {atm_strike} PE"
+        # You would need a symbol mapper to get tokens here.
+        # For this framework, let's pretend we have them.
+        ce_token = "12345" 
+        pe_token = "12346"
+
+        qty = config.MAX_POSITION_SIZE # Or define specific lot size logic
+
+        # Place Orders via Risk Manager
+        if self.risk_manager.check_trade_limits(qty):
+            ce_order = self.broker.place_order("SELL", "NFO", ce_token, qty, "INTRADAY", "MARKET", 0, ce_symbol)
+            pe_order = self.broker.place_order("SELL", "NFO", pe_token, qty, "INTRADAY", "MARKET", 0, pe_symbol)
+            
+            if ce_order and pe_order:
+                self.state = "IN_POSITION"
+                # Fetch entry prices to set SL/TP
+                ce_entry_price = self.broker.get_ltp("NFO", ce_token, ce_symbol) or 0
+                pe_entry_price = self.broker.get_ltp("NFO", pe_token, pe_symbol) or 0
+                
+                self.positions[ce_symbol] = {
+                    'token': ce_token, 'type': 'CE', 'qty': qty, 'entry': ce_entry_price,
+                    'sl': ce_entry_price + config.STOP_LOSS_PER_LOT, # Simplified point based SL
+                    'target': ce_entry_price - config.TARGET_PROFIT_PER_LOT # Shorting, so lower is better
+                }
+                self.positions[pe_symbol] = {
+                    'token': pe_token, 'type': 'PE', 'qty': qty, 'entry': pe_entry_price,
+                    'sl': pe_entry_price + config.STOP_LOSS_PER_LOT, 
+                    'target': pe_entry_price - config.TARGET_PROFIT_PER_LOT 
+                }
+                logger.info(f"Entered Positions. CE Entry: {ce_entry_price}, PE Entry: {pe_entry_price}")
+
+    def monitor_positions(self):
+        if not self.positions:
+            self.state = "COMPLETED"
+            return
+            
+        total_mtm = 0
+        keys_to_remove = []
+        
+        for symbol, pos in self.positions.items():
+            ltp = self.broker.get_ltp("NFO", pos['token'], symbol)
+            if not ltp: continue
+            
+            # Update MTM (Short position: Entry - LTP)
+            # This is per unit. Total MTM = (Entry - LTP) * Qty
+            pnl = (pos['entry'] - ltp) * pos['qty']
+            total_mtm += pnl
+            
+            # Check SL
+            if ltp >= pos['sl']:
+                logger.info(f"SL Hit for {symbol}. LTP: {ltp}, SL: {pos['sl']}")
+                self.broker.place_order("BUY", "NFO", pos['token'], pos['qty'], "INTRADAY", "MARKET", 0, symbol)
+                keys_to_remove.append(symbol)
+            
+            # Check Target
+            elif ltp <= pos['target']:
+                logger.info(f"Target Hit for {symbol}. LTP: {ltp}, Target: {pos['target']}")
+                self.broker.place_order("BUY", "NFO", pos['token'], pos['qty'], "INTRADAY", "MARKET", 0, symbol)
+                keys_to_remove.append(symbol)
+                
+        # Clean up closed positions
+        for k in keys_to_remove:
+            del self.positions[k]
+            
+        self.risk_manager.update_pnl(total_mtm + self.pnl_locked)
+
+    def exit_all_positions(self, reason="Force Exit"):
+        logger.info(f"Exiting all positions: {reason}")
+        for symbol, pos in self.positions.items():
+             self.broker.place_order("BUY", "NFO", pos['token'], pos['qty'], "INTRADAY", "MARKET", 0, symbol)
+        self.positions.clear()
+        self.state = "COMPLETED"
+
+
+--- FILE: strategy_engine.py ---
+
+def pick_strategy(regime):
+    """
+    Returns strategy based on Regime (from market_regime_engine).
+    Regimes: TRENDING_UP, TRENDING_DOWN, SIDEWAYS, VOLATILE, SLOW, VOLATILE_UP, VOLATILE_DOWN
+    """
+    regime = regime.upper()
+    
+    if "TRENDING_UP" in regime:
+        return "BUY CE"
+    elif "TRENDING_DOWN" in regime:
+        return "BUY PE"
+    elif "VOLATILE_UP" in regime:
+        return "BUY CE (Volatile)"
+    elif "VOLATILE_DOWN" in regime:
+        return "BUY PE (Volatile)"
+    elif "SIDEWAYS" in regime:
+        return "STRADDLE SELL (Short)"
+    elif "VOLATILE" in regime: # Pure Volatile w/o clear trend
+        return "STRANGLE BUY (Long)"
+    elif "SLOW" in regime:
+        return "DEBIT SPREAD"
+        
+    return "WAIT"
+
+def get_trade_type_label(ce_or_pe, regime):
+    if ce_or_pe == "CE": return "Long Call"
+    if ce_or_pe == "PE": return "Long Put"
+    if "STRADDLE" in regime: return "Short Straddle"
+    if "STRANGLE" in regime: return "Long Strangle"
+    return "Custom"
+
+
+--- FILE: stream_engine.py ---
+
+from kiteconnect import KiteTicker
+from config import API_KEY, ACCESS_TOKEN
+import logging
+import threading
+import time
+
+# Global cache for LTP
+LTP_CACHE = {}
+
+class StreamEngine:
+    def __init__(self):
+        self.kws = None
+        self.tokens = []
+        self.is_connected = False
+        self.lock = threading.Lock()
+        
+    def start(self, tokens_list):
+        """
+        Starts the KiteTicker in a separate thread.
+        """
+        self.tokens = tokens_list
+        # In a real scenario, we would initialize KiteTicker here
+        # self.kws = KiteTicker(API_KEY, ACCESS_TOKEN)
+        # self.kws.on_ticks = self.on_ticks
+        # self.kws.on_connect = self.on_connect
+        # self.kws.connect(threaded=True)
+        
+        # For now, we simulate a streamer or just rely on API polling
+        # as we cannot open a real WebSocket without valid tokens/network in this env.
+        print(f"[StreamEngine] Broker Ticker Simulation Started for {len(tokens_list)} tokens.")
+        self.is_connected = True
+        
+    def on_ticks(self, ws, ticks):
+        with self.lock:
+            for tick in ticks:
+                LTP_CACHE[tick['instrument_token']] = tick['last_price']
+                
+    def on_connect(self, ws, response):
+        ws.subscribe(self.tokens)
+        ws.set_mode(ws.MODE_LTP, self.tokens)
+        
+    def get_ltp(self, token):
+        start_time = time.time()
+        # Return cached if available, else None
+        return LTP_CACHE.get(token, None)
+        
+    def stop(self):
+        if self.kws:
+            self.kws.close()
+            
+stream_bot = StreamEngine()
+
+
+--- FILE: suggestion_engine.py ---
+
+import time
+import user_profile
+import kite_data
+import atm_engine
+import position_sizing
+import market_regime_engine
+import strategy_engine
+import expiry_engine
+import otm_engine
+import exit_engine
+import trailing_sl_engine
+import trade_journal
+import margin_engine
+from auto_symbol_selector import pick_best_symbol
+import oi_analysis_engine
+import hedging_engine
+import timeframe_engine
+import telegram_interface
+
+
+# -------------------------------------------------------------------------
+# VALIDATION HELPER
+# -------------------------------------------------------------------------
+def validate_option(symbol, kite):
+    """
+    STRICT VALIDATION:
+    1. LTP >= 2
+    2. Volume >= 5000
+    3. OI >= 10000
+    """
+    data = kite_data.get_real_option_data(symbol, kite)
+    if not data:
+        print(f"[!] Could not fetch data for {symbol}")
+        return None
+        
+    ltp = data['ltp']
+    vol = data['volume']
+    oi = data['oi']
+    
+    if ltp is None or ltp < 2:
+        print(f"[!] Invalid Premium: {ltp} (Must be > 2). Skipping {symbol}")
+        return None
+        
+    if vol < 5000:
+        print(f"[!] Low Liquidity: Volume {vol} < 5000. Skipping {symbol}")
+        return None
+        
+    if oi < 10000:
+        print(f"[!] Insufficient OI: {oi} < 10000. Skipping {symbol}")
+        return None
+        
+    return ltp
+
+def suggest_trade(capital, margin, **kwargs):
+    """
+    Analyzes market with Advanced Quantitative Logic.
+    Strict Compliance: Zerodha Kite Only.
+    """
+    # Initialize Logger if not provided (fallback for legacy calls, though we should always pass it)
+    import logger as logger_module
+    if 'logger' not in kwargs:
+         logger = logger_module.TelegramLogger() # Local instance if none passed
+    else:
+         logger = kwargs['logger']
+
+    logger.log(f"\n--- ZERODHA QUANT OPTION BOT ---")
+    
+    # 3. Get API Instance
+    kite = kite_data.get_kite()
+    
+    # 1. User Profile
+    profile = user_profile.get_user_profile()
+    risk_level = profile.get("risk_level", "medium")
+    
+    # 2. Auto-Selection Execution
+    logger.log("[*] Scanning Markets (Trend/Momentum/Volatility)...")
+    symbol, reason_msg, trend_dir, volatility, spot_price = pick_best_symbol()
+    
+    if spot_price is None or spot_price == 0:
+        # Mapping for Indices check
+        idx_map = {"NIFTY": "NSE:NIFTY 50", "BANKNIFTY": "NSE:NIFTY BANK", "FINNIFTY": "NSE:NIFTY FIN SERVICE"}
+        lookup_sym = idx_map.get(symbol, f"NSE:{symbol}")
+        
+        # We need kite instance passed to get_ltp or use kite directly here
+        spot_price = kite_data.get_ltp(lookup_sym, kite) # This now handles Index Tokens correctly if name matches
+
+    if spot_price is None or spot_price == 0:
+        # Try direct generic fetch via token map if name is standard
+        spot_price = kite_data.get_ltp(symbol, kite)
+
+    if spot_price is None or spot_price == 0:
+        logger.log("[!] Could not fetch Spot Price. Aborting.")
+        return
+
+    # 3. New Quantitative Checks
+    # OI & IV (REAL)
+    pcr = oi_analysis_engine.calculate_pcr(kite, symbol)
+    
+    # Get ATM to check IV and OI Signal of the "Tradeable" instrument
+    atm = atm_engine.get_atm_strike(spot_price, symbol)
+    expiry_data = expiry_engine.get_expiry(symbol)
+    
+    # For IV and OI, we check the ATM CE for Bullish/Bearish context or just generic?
+    # User said "get_iv_value" and "IV Rank".
+    # We will pick ATM CE as the reference for IV Rank.
+    atm_sym_base = expiry_engine.get_option_symbol(symbol, expiry_data['date'], atm, "CE")
+    atm_sym = "NFO:" + atm_sym_base
+    
+    iv = kite_data.get_iv_value(kite, atm_sym)
+    if iv: oi_analysis_engine.update_iv_history(symbol, iv)
+    iv_rank = oi_analysis_engine.calculate_iv_rank(symbol)
+    
+    # OI Signal (Using Delta)
+    oi_delta, quote_data = oi_analysis_engine.get_oi_delta(kite, atm_sym)
+    net_change = quote_data.get('net_change', 0)
+    oi_signal = oi_analysis_engine.interpret_oi_signal(net_change, oi_delta)
+    
+    # Timeframe
+    timeframe = timeframe_engine.pick_timeframe(volatility)
+    
+    logger.log("\n========================================")
+    logger.log(f" MARKET CONTEXT: {symbol}")
+    logger.log("========================================")
+    logger.log(f"Trend      : {trend_dir} (Reason: {reason_msg})")
+    logger.log(f"Volatility : {volatility}")
+    logger.log(f"Timeframe  : {timeframe}")
+    logger.log(f"OI Signal  : {oi_signal} (PCR: {pcr:.2f})")
+    logger.log(f"IV Rank    : {iv_rank} (IV: {iv if iv else 'N/A'})")
+    logger.log(f"Spot Price : {spot_price}")
+    logger.log("========================================")
+    logger.log(f"Capital: {capital} | Avail Margin: {margin}")
+    
+    # Decide Strategy
+    final_view = "BULLISH" # Default logic from trend/pcr
+    if "DOWN" in trend_dir: final_view = "BEARISH"
+    elif "UP" in trend_dir: final_view = "BULLISH"
+    else:
+        if pcr < 0.8: final_view = "BEARISH"
+        else: final_view = "BULLISH"
+        
+    logger.log(f"[-] Final View: {final_view}")
+    
+    # Strike Integration
+    atm = atm_engine.get_atm_strike(spot_price, symbol)
+    expiry_data = expiry_engine.get_expiry(symbol)
+    
+    final_trade_legs = []
+    
+    # --- STRATEGY ROUTING BASED ON MARGIN & CAPITAL ---
+    # UPDATED LOGIC (Prioritize Margin Availability):
+    # Margin >= 1.5L : Option Selling (Best Probability)
+    # Margin >= 50k  : Hedged Spreads (Balanced)
+    # Margin < 50k   : Buy Options (Low Capital/Margin)
+    
+    # Defaults
+    is_hedged = False
+    strategy_name = ""
+    
+    if margin >= 150000:
+        # HIGH MARGIN -> Sell Strategies
+        logger.log(f"[-] High Margin (>=1.5L). Strategy: OPTION SELLING")
+        # Invert View for Selling
+        sell_type = "PE" if final_view == "BULLISH" else "CE"
+        action = "SELL"
+        opt_type = sell_type 
+        
+        # STRICT SYMBOL CONSTRUCTION
+        # Format: <UNDERLYING><YY><MON><STRIKE><CE/PE>
+        sym_base = expiry_engine.get_option_symbol(symbol, expiry_data['date'], atm, sell_type)
+        sym = "NFO:" + sym_base
+        
+        # 1. FIX LTP + VALIDATION
+        prem = validate_option(sym, kite)
+        
+        # 8. DO NOT PLACE TRADES WITHOUT VALID LTP
+        if prem is None:
+            logger.log(f"[!] Validation Failed for {sym}. Abort trade.")
+            return
+
+        # Check Margin again
+        est_margin = margin_engine.estimate_short_margin(symbol, atm, prem)
+        lots = int(margin / est_margin) if est_margin > 0 else 0
+        
+        final_trade_legs.append({
+            "action": "SELL", "symbol": sym,
+            "strike": atm, "type": sell_type,
+            "qty": (lots if lots > 0 else 1) * (50 if "NIFTY" in symbol else 15),
+            "premium": prem
+        })
+
+    elif margin >= 50000:
+        # MID MARGIN -> Hedged Spreads
+        print(f"[-] Mid Margin (50k-1.5L). Strategy: HEDGED SPREAD")
+        hedged_strat = hedging_engine.get_hedged_strategy(
+            final_view, capital, margin, symbol, expiry_data, atm
+        )
+        strategy_name = hedged_strat['name']
+        logger.log(f"    -> Suggesting: {strategy_name}")
+        logger.log(f"    -> Reason: {hedged_strat['reason']}")
+        is_hedged = True
+        
+        # Construct Legs
+        for leg in hedged_strat['legs']:
+            # STRICT SYMBOL
+            leg_sym_base = expiry_engine.get_option_symbol(symbol, expiry_data['date'], leg['strike'], leg['type'])
+            leg_sym = "NFO:" + leg_sym_base
+            
+            prem = validate_option(leg_sym, kite)
+            if prem is None:
+                logger.log(f"[!] Validation Failed for {leg_sym}. Skipping Leg.")
+                # We should strictly abort the whole strategy if one leg fails validation to avoid naked positions
+                logger.log("[!] Strategy Aborted due to leg failure.")
+                return 
+                
+            final_trade_legs.append({
+                "action": leg['action'], "symbol": leg_sym,
+                "strike": leg['strike'], "type": leg['type'],
+                "qty": leg['quantity'] * (50 if "NIFTY" in symbol else 15), # 1 Lot approx
+                "premium": prem
+            })
+            
+    else:
+        # LOW MARGIN -> Buy Cheap OTM/ATM
+        opt_type = "CE" if final_view == "BULLISH" else "PE"
+        logger.log(f"[-] Low Margin (<50k). Strategy: BUY OPTION {opt_type}")
+        action = "BUY"
+        
+        # OTM Engine needs 'kite' passed
+        otm_data = otm_engine.find_affordable_otm(capital, symbol, atm, expiry_data, opt_type, kite)
+        
+        # Validate the OTM pick
+        if otm_data["premium"] is None or otm_data["premium"] == 0:
+             logger.log("[!] No valid premium found for Buying. Abort.")
+             return
+             
+        # Double Check Validation on the found symbol
+        # OTM engine might have returned a symbol, but we need to check Vol/OI
+        check_prem = validate_option(otm_data["symbol"], kite)
+        if not check_prem:
+             logger.log("[!] Selected OTM failed strict validation (Vol/OI).")
+             return
+
+        final_trade_legs.append({
+            "action": "BUY", "symbol": otm_data["symbol"], 
+            "strike": otm_data["strike"], "type": opt_type, 
+            "qty": otm_data["qty"], 
+            "premium": otm_data["premium"]
+        })
+    
+    # 5. Output Trade Plan
+    logger.log("\n========================================")
+    logger.log(f" TRADE PLAN: {strategy_name if is_hedged else (action + ' ' + opt_type)}")
+    logger.log("========================================")
+    
+    total_cost = 0
+    total_margin = 0
+    
+    for leg in final_trade_legs:
+        val = leg['qty'] * leg['premium']
+
+        # Calculate SL/Target for Display
+        sl_price = 0
+        target_price = 0
+        if leg['action'] == "BUY":
+            sl_price = leg['premium'] * 0.80   # 20% SL
+            target_price = leg['premium'] * 1.30 # 30% Target
+            total_cost += val
+        else:
+            sl_price = leg['premium'] * 1.30   # 30% SL (Short)
+            target_price = leg['premium'] * 0.50 # 50% Target (Short)
+            total_cost -= val # Premium received
+            
+            # Simple margin est
+            total_margin += 60000 # Rough est per lot short
+
+        logger.log(f"Leg {final_trade_legs.index(leg)+1}: {leg['action']} {leg['symbol']} @ {leg['premium']}")
+        logger.log(f"       Qty: {leg['qty']} | Val: {val:.2f}")
+        logger.log(f"       [SL]: {sl_price:.2f} | [Tgt]: {target_price:.2f}")
+
+        # Store for alert
+        leg['sl'] = sl_price
+        leg['target'] = target_price
+            
+    logger.log(f"Net Premium Impact: {total_cost:.2f} ({'Debit' if total_cost > 0 else 'Credit'})")
+    logger.log(f"\nEst. Capital/Margin Req: {total_margin if total_margin > 0 else total_cost:.2f}")
+
+    # 7. Send Telegram Alert
+    alert_msg = f"🚀 *Trade Suggestion*\n\n"
+    alert_msg += f"Symbol: {symbol}\nView: {final_view}\nStrateg: {strategy_name if is_hedged else (action + ' ' + opt_type)}\n"
+    alert_msg += f"Spot: {spot_price}\n\n*Legs:*\n"
+    for leg in final_trade_legs:
+        alert_msg += f"{leg['action']} {leg['symbol']} @ {leg['premium']}\nTo: 🎯 {leg['target']:.1f} | 🛑 {leg['sl']:.1f}\n(Qty: {leg['qty']})\n"
+    alert_msg += f"\nEst. Cost: {total_margin if total_margin > 0 else total_cost:.2f}"
+    
+    telegram_interface.send_alert(alert_msg)
+
+
+--- FILE: telegram_interface.py ---
+
+import logging
+import threading
+import asyncio
+import requests
+import time
+from telegram import Update
+from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler
+import config
+from logger import TelegramLogger
+import suggestion_engine
+
+# Setup logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+
+# Global variable to store the bot application
+application = None
+auto_thread = None
+stop_auto_event = threading.Event()
+
+def send_alert(message):
+    """
+    Sends a message to the configured Telegram user.
+    Uses requests for synchronous compatible sending from anywhere in the bot.
+    """
+    if not config.TELEGRAM_BOT_TOKEN or not config.TELEGRAM_CHAT_ID:
+        print("[!] Telegram credentials missing in config.py")
+        return
+
+    url = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": config.TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "Markdown"
+    }
+    
+    try:
+        requests.post(url, json=payload)
+    except Exception as e:
+        print(f"[!] Error sending Telegram alert: {e}")
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="🤖 *Zerodha Trading Bot Active*\n\nCommands:\n/scan - Run Instant Analysis\n/auto <min> - Start Auto Loop\n/stop - Stop Auto Loop\n/status - Check Status\n/pnl - Check PnL",
+        parse_mode='Markdown'
+    )
+
+async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await context.bot.send_message(chat_id=update.effective_chat.id, text="🔍 *Scanning Market... Please Wait.*", parse_mode='Markdown')
+    
+    # Run analysis in a separate thread to not block the bot
+    def run_scan():
+        logger = TelegramLogger()
+        try:
+            # Use defaults from config or hardcoded for now since no input
+            # If config.MARGIN is not set, we might default to CAPITAL (assuming full cash)
+             # or we can read from config.py if I add a MARGIN plain var there.
+             # For now, let's assume CAPITAL is the limit.
+            margin = config.CAPITAL 
+            suggestion_engine.suggest_trade(config.CAPITAL, margin, logger=logger)
+            
+            # Send the captured log as a message
+            full_log = logger.get_logs()
+            # Split into chunks if too long (Telegram limit 4096)
+            if len(full_log) > 4000:
+                full_log = full_log[:4000] + "\n...[Truncated]"
+            
+            send_alert(f"📝 *Analysis Report*\n```\n{full_log}\n```")
+        except Exception as e:
+            send_alert(f"❌ Error during scan: {str(e)}")
+
+    threading.Thread(target=run_scan).start()
+
+async def auto_loop(interval_min):
+    global stop_auto_event
+    send_alert(f"🔄 *Auto-Mode Started*. Running every {interval_min} minutes.")
+    
+    while not stop_auto_event.is_set():
+        # Run Scan
+        logger = TelegramLogger()
+        try:
+            suggestion_engine.suggest_trade(config.CAPITAL, config.CAPITAL, logger=logger)
+            # Only send alerts on trades (logic inside suggestion_engine does this)
+            # But the user might want a heartbeat ??
+            # For now, let's stay silent unless trade suggested (which suggestion_engine handles via send_alert)
+            # OR we can send the log if we want full verbose mode.
+            # Let's send a short heartbeat
+            # send_alert(f"✅ Auto-Scan Completed at {time.strftime('%H:%M')}")
+            pass
+        except Exception as e:
+            send_alert(f"❌ Auto-Scan Error: {e}")
+            
+        # Wait for interval
+        stop_auto_event.wait(interval_min * 60)
+
+async def auto_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global auto_thread, stop_auto_event
+    
+    if auto_thread and auto_thread.is_alive():
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="⚠️ Auto-mode is already running. Use /stop first.")
+        return
+
+    try:
+        minutes = int(context.args[0]) if context.args else 15
+        if minutes < 1: minutes = 1
+    except:
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="ℹ️ Usage: /auto <minutes>\nDefaulting to 15 mins.")
+        minutes = 15
+
+    stop_auto_event.clear()
+    # We need to run the loop in a thread, but the async loop helper is internal. 
+    # Actually we can just run a standard threading Thread that calls a synchronous wrapper.
+    # But wait, my auto_loop above is async. Let's make it sync for threading.
+    
+    def sync_auto_loop_wrapper(interval):
+         asyncio.run(auto_loop(interval)) # This might conflict with existing loop.
+         # Better: Make auto_loop synchronous.
+         
+    # RE-DEFINING auto_loop as sync for simplicity in thread
+    def sync_auto_loop(interval):
+        send_alert(f"🔄 *Auto-Mode Started* (Interval: {interval}m)")
+        while not stop_auto_event.is_set():
+             logger = TelegramLogger()
+             try:
+                 suggestion_engine.suggest_trade(config.CAPITAL, config.CAPITAL, logger=logger)
+             except Exception as e:
+                 send_alert(f"❌ Auto-Scan Error: {e}")
+             stop_auto_event.wait(interval * 60)
+        send_alert("🛑 Auto-Mode Stopped.")
+
+    auto_thread = threading.Thread(target=sync_auto_loop, args=(minutes,))
+    auto_thread.start()
+    
+    await context.bot.send_message(chat_id=update.effective_chat.id, text=f"✅ background thread started.")
+
+async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global stop_auto_event
+    stop_auto_event.set()
+    await context.bot.send_message(chat_id=update.effective_chat.id, text="🛑 Stopping auto-mode...")
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # This is a placeholder. In a real app, you'd fetch state from a shared object or database.
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="✅ Bot is running properly.\nMode: Monitoring\nCapital: ₹" + str(config.CAPITAL)
+    )
+
+import position_advisor_engine
+from zerodha_adapter import ZerodhaAdapter
+
+async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+     await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="📊 *PnL Update*\nNo active trades yet."
+    )
+
+async def advice_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Triggers the Position Advisor analysis.
+    """
+    status_msg = await context.bot.send_message(chat_id=update.effective_chat.id, text="🧠 *Analyzing Positions...*")
+    
+    # Run in thread
+    def run_advisor():
+        try:
+            # 1. Fetch positions
+            za = ZerodhaAdapter()
+            za.login() # Should use cached token ideally or re-login if needed. 
+            # Note: The adapter currently is interactive login. We might need a better way to share session.
+            # For now, let's assume session is valid or we use the 'get_kite()' directly if simple.
+            # Actually, `zerodha_adapter` is better wrapper.
+            # But let's use `kite_data.get_kite()` for the kite instance if we just need market data,
+            # and `zerodha_adapter` for positions.
+            
+            # Using zerodha_adapter might trigger interactive login again if not persistent.
+            # Let's try to see if we can use the global kite instance if available.
+            import kite_data
+            k = kite_data.get_kite()
+            if not k:
+                send_alert("⚠️ Kite Session invalid. Cannot analyze.")
+                return
+
+            # Fetch positions via kite directly to avoid re-login complexity of Adapter class for now
+            positions = k.positions()['net']
+            
+            # 2. Analyze
+            report = position_advisor_engine.get_advice_report(k, positions)
+            
+            send_alert(report)
+            
+        except Exception as e:
+            send_alert(f"❌ Advisor Error: {e}")
+
+    threading.Thread(target=run_advisor).start()
+
+def run_telegram_bot():
+    """
+    Starts the Telegram bot listener.
+    """
+    global application
+    if not config.TELEGRAM_BOT_TOKEN or "YOUR_" in config.TELEGRAM_BOT_TOKEN:
+        print("[!] Invalid Telegram Token. Bot listener will not start.")
+        return
+
+    print("--- Starting Telegram Bot Listener ---")
+    application = ApplicationBuilder().token(config.TELEGRAM_BOT_TOKEN).build()
+    
+    start_handler = CommandHandler('start', start_command)
+    scan_handler = CommandHandler('scan', scan_command)
+    auto_handler = CommandHandler('auto', auto_command)
+    stop_handler = CommandHandler('stop', stop_command)
+    status_handler = CommandHandler('status', status_command)
+    pnl_handler = CommandHandler('pnl', pnl_command)
+    
+    application.add_handler(start_handler)
+    application.add_handler(scan_handler)
+    application.add_handler(auto_handler)
+    application.add_handler(stop_handler)
+    application.add_handler(status_handler)
+    application.add_handler(pnl_handler)
+    
+    advice_handler = CommandHandler('advice', advice_command)
+    application.add_handler(advice_handler)
+    
+    # Run the bot polling
+    application.run_polling()
+
+def start_bot_in_thread():
+    """
+    Helper to run the bot in a separate thread so it doesn't block the main trading loop.
+    """
+    bot_thread = threading.Thread(target=run_telegram_bot, daemon=True)
+    bot_thread.start()
+
+
+--- FILE: timeframe_engine.py ---
+
+def pick_timeframe(volatility_state="Normal"):
+    """
+    Returns suggested timeframe based on volatility.
+    """
+    if volatility_state == "High":
+        return "5m" # Fast scalping
+    elif volatility_state == "Low":
+        return "15m" # Swing / Trend
+    elif volatility_state == "Extreme":
+        return "1m" # Algo/HFT (or stay out)
+    else:
+        return "5m" # Default intraday
+
+
+--- FILE: trade_journal.py ---
+
+import csv
+import os
+import datetime
+
+JOURNAL_FILE = "trade_journal.csv"
+
+def log_trade(symbol, strike, expiry_type, entry, exit_price, pnl, reason, exit_reason):
+    """
+    Logs trade details to a CSV file.
+    """
+    file_exists = os.path.isfile(JOURNAL_FILE)
+    
+    with open(JOURNAL_FILE, mode='a', newline='') as file:
+        writer = csv.writer(file)
+        
+        # Header if new
+        if not file_exists:
+            writer.writerow(["Timestamp", "Symbol", "Strike", "ExpiryType", "Entry", "Exit", "PnL", "EntryReason", "ExitReason"])
+            
+        writer.writerow([
+            datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            symbol,
+            strike,
+            expiry_type,
+            round(entry, 2),
+            round(exit_price, 2),
+            round(pnl, 2),
+            reason,
+            exit_reason
+        ])
+    
+    print(f"[Journal] Trade saved to {JOURNAL_FILE}")
+
+
+--- FILE: trailing_sl_engine.py ---
+
+def get_trailing_sl(entry_price, current_price, current_sl):
+    """
+    Calculates the new trailing stop-loss based on price movement.
+    
+    Logic:
+    - If price > 10% of entry, lock SL at -5% (Break-even-ish/Small Loss)
+    - If price > 20% of entry, lock SL at +5% (Profit Lock)
+    - If price > 30% of entry, lock SL at +15% (Deep Profit Lock)
+    - Default: Return the existing SL (which starts at 70% of entry)
+    
+    Returns:
+        float: The new stop-loss price (highest of calculated or current_sl).
+    """
+    if entry_price <= 0: return current_sl
+    
+    new_sl = current_sl
+    
+    # Check Price thresholds
+    if current_price >= entry_price * 1.30:
+        # Trail to +15% profit
+        proposed = entry_price * 1.15
+        if proposed > new_sl: new_sl = proposed
+        
+    elif current_price >= entry_price * 1.20:
+        # Trail to +5% profit
+        proposed = entry_price * 1.05
+        if proposed > new_sl: new_sl = proposed
+        
+    elif current_price >= entry_price * 1.10:
+        # Trail to -5% (Reduce risk)
+        proposed = entry_price * 0.95
+        if proposed > new_sl: new_sl = proposed
+        
+    return new_sl
+
+
+--- FILE: user_profile.py ---
+
+def get_user_profile():
+    """
+    Returns the user's trading profile and risk settings.
+    You can modify these return values to change the bot's behavior.
+    """
+    return {
+        # Risk Level: "low", "medium", "high"
+        # Affects Stoploss and Target width.
+        "risk_level": "medium",
+
+        # Trading Style: "scalper", "intraday", "swing", "positional"
+        # Affects timeframes and strictness of exits (logic to be implemented).
+        "trading_style": "intraday",
+
+        # Capital Allocation: Percentage of total capital to use per trade.
+        # e.g., 0.50 means use 50% of available capital.
+        "capital_allocation": 0.50 
+    }
+
+
+--- FILE: utils.py ---
+
+import time
+import logging
+import threading
+from collections import deque
+import config
+
+# Setup Logging with Algo ID
+logging.basicConfig(
+    level=logging.INFO,
+    format=f'%(asctime)s - [%(levelname)s] - [AlgoID:{config.ALGO_ID}] - %(message)s',
+    handlers=[
+        logging.FileHandler("trading_bot.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("OptionsBot")
+
+class RateLimiter:
+    """
+    Token Bucket or Sliding Window implementation to ensure OPS < 10.
+    """
+    def __init__(self, max_calls: int, period: float):
+        self.max_calls = max_calls
+        self.period = period
+        self.calls = deque()
+        self.lock = threading.Lock()
+
+    def wait_for_token(self):
+        with self.lock:
+            now = time.time()
+            # Remove calls older than the period
+            while self.calls and now - self.calls[0] >= self.period:
+                self.calls.popleft()
+            
+            if len(self.calls) >= self.max_calls:
+                sleep_time = self.period - (now - self.calls[0])
+                logger.warning(f"Rate limit reached. Sleeping for {sleep_time:.2f}s")
+                time.sleep(sleep_time)
+                # Re-check or just assume we are good now is a simple approach
+                # For strictness, we recurse or re-evaluate, but sleep is usually enough
+                self.calls.popleft() 
+            
+            self.calls.append(time.time())
+
+# Global Rate Limiter Instance
+exchange_rate_limiter = RateLimiter(max_calls=config.EXCHANGE_MAX_OPS - 1, period=1.0) # Buffer of 1
+
+def validate_ip(current_ip: str):
+    """
+    Checks if the current machine's IP matches the whitelisted IP.
+    """
+    if current_ip != config.WHITELISTED_IP:
+        logger.critical(f"IP Mismatch! Current: {current_ip}, Allowed: {config.WHITELISTED_IP}")
+        return False
+    return True
+
+
+--- FILE: zerodha_adapter.py ---
+
+import logging
+from kiteconnect import KiteConnect
+import config
+from broker_interface import BrokerInterface
+from utils import logger, exchange_rate_limiter
+
+class ZerodhaAdapter(BrokerInterface):
+    def __init__(self):
+        self.kite = KiteConnect(api_key=config.API_KEY)
+        self.access_token = None
+
+    def login(self):
+        """
+        Zerodha login is interactive (Request Token -> Access Token).
+        For automated login, user typically needs to handle the Request Token flow freshly
+        or use a stored access token if validity persists (1 day).
+        """
+        try:
+            print("To login to Zerodha:")
+            print(f"1. Login to: {self.kite.login_url()}")
+            request_token = input("2. Enter the 'request_token' from the redirect URL: ").strip()
+            
+            data = self.kite.generate_session(request_token, api_secret=config.API_SECRET)
+            self.kite.set_access_token(data["access_token"])
+            self.access_token = data["access_token"]
+            
+            logger.info("Zerodha Login Successful")
+            return True
+        except Exception as e:
+            logger.error(f"Zerodha Login Failed: {e}")
+            return False
+
+    def logout(self):
+        try:
+             # self.kite.invalidate_access_token() # Optional
+            logger.info("Zerodha Session Closed (Local)")
+        except Exception as e:
+            logger.error(f"Logout Failed: {e}")
+
+    def get_ltp(self, exchange, symbol_token, symbol_name):
+        """
+        Zerodha uses 'Exchange:Symbol' format for fetching LTP.
+        Example: 'NSE:NIFTY 50', 'NFO:NIFTY24JAN21500CE'
+        """
+        exchange_rate_limiter.wait_for_token()
+        try:
+            # Construct instrument id
+            # If symbol_name is "NIFTY 50", we use "NSE:NIFTY 50"
+            # If it's an option like "NIFTY 21000 CE", we need "NFO:..."
+            # For simplicity, assuming symbol_name is passed in correct Kite format or we prepend
+            
+            instrument = f"{exchange}:{symbol_name}"
+            quote = self.kite.ltp(instrument)
+            
+            if instrument in quote:
+                return quote[instrument]['last_price']
+            else:
+                logger.warning(f"LTP not found for {instrument}")
+                return None
+        except Exception as e:
+            logger.error(f"Error fetching LTP for {symbol_name}: {e}")
+            return None
+
+    def place_order(self, transaction_type, exchange, symbol_token, qty, product_type, order_type="MARKET", price=0, symbol_name=""):
+        """
+        transaction_type: 'BUY' or 'SELL'
+        """
+        exchange_rate_limiter.wait_for_token()
+        
+        # Kite Constants
+        trans_type = self.kite.TRANSACTION_TYPE_BUY if transaction_type == "BUY" else self.kite.TRANSACTION_TYPE_SELL
+        prod_type = self.kite.PRODUCT_MIS if product_type == "INTRADAY" else self.kite.PRODUCT_NRML
+        ord_type = self.kite.ORDER_TYPE_MARKET if order_type == "MARKET" else self.kite.ORDER_TYPE_LIMIT
+        
+        try:
+            order_id = self.kite.place_order(
+                tradingsymbol=symbol_name,
+                exchange=exchange,
+                transaction_type=trans_type,
+                quantity=qty,
+                variety=self.kite.VARIETY_REGULAR,
+                order_type=ord_type,
+                product=prod_type,
+                price=price,
+                validity=self.kite.VALIDITY_DAY,
+                tag=config.ALGO_ID
+            )
+            logger.info(f"Order Placed: {transaction_type} {qty} x {symbol_name}. Order ID: {order_id}")
+            return order_id
+        except Exception as e:
+            logger.error(f"Order Placement Failed: {e}")
+            return None
+
+    def get_positions(self):
+        exchange_rate_limiter.wait_for_token()
+        try:
+            # Kite returns {'net': [], 'day': []}
+            kite_pos = self.kite.positions()
+            
+            # Adapt to internal contract (list of positions under 'data')
+            # Angel One uses 'netqty', Kite uses 'quantity' (for net positions)
+            adapted_data = []
+            if 'net' in kite_pos:
+                for pos in kite_pos['net']:
+                    adapted_pos = {
+                        'tradingsymbol': pos['tradingsymbol'],
+                        'symboltoken': pos['instrument_token'], # Kite uses instrument_token
+                        'exchange': pos['exchange'],
+                        'netqty': pos['quantity'], # Net quantity
+                        'ltp': pos['last_price'],
+                        'producttype': pos['product']
+                    }
+                    adapted_data.append(adapted_pos)
+            
+            return {"data": adapted_data}
+        except Exception as e:
+            logger.error(f"Error fetching positions: {e}")
+            return None
+
+    def get_option_chain_data(self, symbol, expiry):
+        # Zerodha api doesn't directly give full chain.
+        return {}

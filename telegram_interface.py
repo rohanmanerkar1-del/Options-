@@ -148,11 +148,53 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text="✅ Bot is running properly.\nMode: Monitoring\nCapital: ₹" + str(config.CAPITAL)
     )
 
+import position_advisor_engine
+from zerodha_adapter import ZerodhaAdapter
+
 async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
      await context.bot.send_message(
         chat_id=update.effective_chat.id,
         text="📊 *PnL Update*\nNo active trades yet."
     )
+
+async def advice_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Triggers the Position Advisor analysis.
+    """
+    status_msg = await context.bot.send_message(chat_id=update.effective_chat.id, text="🧠 *Analyzing Positions...*")
+    
+    # Run in thread
+    def run_advisor():
+        try:
+            # 1. Fetch positions
+            za = ZerodhaAdapter()
+            za.login() # Should use cached token ideally or re-login if needed. 
+            # Note: The adapter currently is interactive login. We might need a better way to share session.
+            # For now, let's assume session is valid or we use the 'get_kite()' directly if simple.
+            # Actually, `zerodha_adapter` is better wrapper.
+            # But let's use `kite_data.get_kite()` for the kite instance if we just need market data,
+            # and `zerodha_adapter` for positions.
+            
+            # Using zerodha_adapter might trigger interactive login again if not persistent.
+            # Let's try to see if we can use the global kite instance if available.
+            import kite_data
+            k = kite_data.get_kite()
+            if not k:
+                send_alert("⚠️ Kite Session invalid. Cannot analyze.")
+                return
+
+            # Fetch positions via kite directly to avoid re-login complexity of Adapter class for now
+            positions = k.positions()['net']
+            
+            # 2. Analyze
+            report = position_advisor_engine.get_advice_report(k, positions)
+            
+            send_alert(report)
+            
+        except Exception as e:
+            send_alert(f"❌ Advisor Error: {e}")
+
+    threading.Thread(target=run_advisor).start()
 
 def run_telegram_bot():
     """
@@ -179,6 +221,9 @@ def run_telegram_bot():
     application.add_handler(stop_handler)
     application.add_handler(status_handler)
     application.add_handler(pnl_handler)
+    
+    advice_handler = CommandHandler('advice', advice_command)
+    application.add_handler(advice_handler)
     
     # Run the bot polling
     application.run_polling()

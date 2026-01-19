@@ -1,12 +1,12 @@
 import logging
 from kiteconnect import KiteConnect
-from config import Config
+import config
 from broker_interface import BrokerInterface
 from utils import logger, exchange_rate_limiter
 
 class ZerodhaAdapter(BrokerInterface):
     def __init__(self):
-        self.kite = KiteConnect(api_key=Config.ZERODHA_API_KEY)
+        self.kite = KiteConnect(api_key=config.API_KEY)
         self.access_token = None
 
     def login(self):
@@ -20,7 +20,7 @@ class ZerodhaAdapter(BrokerInterface):
             print(f"1. Login to: {self.kite.login_url()}")
             request_token = input("2. Enter the 'request_token' from the redirect URL: ").strip()
             
-            data = self.kite.generate_session(request_token, api_secret=Config.ZERODHA_API_SECRET)
+            data = self.kite.generate_session(request_token, api_secret=config.API_SECRET)
             self.kite.set_access_token(data["access_token"])
             self.access_token = data["access_token"]
             
@@ -32,7 +32,7 @@ class ZerodhaAdapter(BrokerInterface):
 
     def logout(self):
         try:
-            # self.kite.invalidate_access_token() # Optional
+             # self.kite.invalidate_access_token() # Optional
             logger.info("Zerodha Session Closed (Local)")
         except Exception as e:
             logger.error(f"Logout Failed: {e}")
@@ -83,7 +83,7 @@ class ZerodhaAdapter(BrokerInterface):
                 product=prod_type,
                 price=price,
                 validity=self.kite.VALIDITY_DAY,
-                tag=Config.ALGO_ID
+                tag=config.ALGO_ID
             )
             logger.info(f"Order Placed: {transaction_type} {qty} x {symbol_name}. Order ID: {order_id}")
             return order_id

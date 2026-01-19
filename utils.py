@@ -2,12 +2,12 @@ import time
 import logging
 import threading
 from collections import deque
-from config import Config
+import config
 
 # Setup Logging with Algo ID
 logging.basicConfig(
     level=logging.INFO,
-    format=f'%(asctime)s - [%(levelname)s] - [AlgoID:{Config.ALGO_ID}] - %(message)s',
+    format=f'%(asctime)s - [%(levelname)s] - [AlgoID:{config.ALGO_ID}] - %(message)s',
     handlers=[
         logging.FileHandler("trading_bot.log"),
         logging.StreamHandler()
@@ -43,13 +43,13 @@ class RateLimiter:
             self.calls.append(time.time())
 
 # Global Rate Limiter Instance
-exchange_rate_limiter = RateLimiter(max_calls=Config.EXCHANGE_MAX_OPS - 1, period=1.0) # Buffer of 1
+exchange_rate_limiter = RateLimiter(max_calls=config.EXCHANGE_MAX_OPS - 1, period=1.0) # Buffer of 1
 
 def validate_ip(current_ip: str):
     """
     Checks if the current machine's IP matches the whitelisted IP.
     """
-    if current_ip != Config.WHITELISTED_IP:
-        logger.critical(f"IP Mismatch! Current: {current_ip}, Allowed: {Config.WHITELISTED_IP}")
+    if current_ip != config.WHITELISTED_IP:
+        logger.critical(f"IP Mismatch! Current: {current_ip}, Allowed: {config.WHITELISTED_IP}")
         return False
     return True

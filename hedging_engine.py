@@ -1,6 +1,6 @@
 import margin_engine
 
-def get_hedged_strategy(view, capital, margin, symbol, expiry_data, atm_strike):
+def get_hedged_strategy(view, capital, margin, symbol, expiry_data, atm_strike, iv_rank=50):
     """
     Suggests a hedged strategy based on view and capital.
     Ideal for margin 20k-40k where naked selling is risky/impossible but Buying is too volatile.
@@ -60,6 +60,10 @@ def get_hedged_strategy(view, capital, margin, symbol, expiry_data, atm_strike):
             
     else:
         # Sideways
+        # RULE: Block Neutral Strats if IV Rank < 20
+        if iv_rank < 20:
+             return {"name": "WAIT", "legs": [], "reason": "Low IV (<20). Iron Condor blocked (Low Premium)."}
+             
         if margin > 40000:
              strategy = {
                 "name": "Iron Condor",

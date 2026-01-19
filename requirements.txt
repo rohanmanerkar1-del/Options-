@@ -4,5 +4,5 @@ python-dotenv
 requests
 logzero
 websocket-client
-
 kiteconnect
+python-telegram-bot

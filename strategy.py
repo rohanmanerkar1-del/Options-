@@ -1,5 +1,5 @@
 from datetime import datetime
-from config import Config
+import config
 from utils import logger
 
 class ShortStraddleStrategy:
@@ -19,7 +19,7 @@ class ShortStraddleStrategy:
 
         if self.state == "WAITING":
             # If Mock mode, we might want to trigger immediately for testing
-            if Config.USE_MOCK_BROKER or current_time_str == Config.STRATEGY_TIME:
+            if config.USE_MOCK_BROKER or current_time_str == config.STRATEGY_TIME:
                 self.enter_positions()
         
         elif self.state == "IN_POSITION":
@@ -54,7 +54,7 @@ class ShortStraddleStrategy:
         ce_token = "12345" 
         pe_token = "12346"
 
-        qty = Config.MAX_POSITION_SIZE # Or define specific lot size logic
+        qty = config.MAX_POSITION_SIZE # Or define specific lot size logic
 
         # Place Orders via Risk Manager
         if self.risk_manager.check_trade_limits(qty):
@@ -69,13 +69,13 @@ class ShortStraddleStrategy:
                 
                 self.positions[ce_symbol] = {
                     'token': ce_token, 'type': 'CE', 'qty': qty, 'entry': ce_entry_price,
-                    'sl': ce_entry_price + Config.STOP_LOSS_PER_LOT, # Simplified point based SL
-                    'target': ce_entry_price - Config.TARGET_PROFIT_PER_LOT # Shorting, so lower is better
+                    'sl': ce_entry_price + config.STOP_LOSS_PER_LOT, # Simplified point based SL
+                    'target': ce_entry_price - config.TARGET_PROFIT_PER_LOT # Shorting, so lower is better
                 }
                 self.positions[pe_symbol] = {
                     'token': pe_token, 'type': 'PE', 'qty': qty, 'entry': pe_entry_price,
-                    'sl': pe_entry_price + Config.STOP_LOSS_PER_LOT, 
-                    'target': pe_entry_price - Config.TARGET_PROFIT_PER_LOT 
+                    'sl': pe_entry_price + config.STOP_LOSS_PER_LOT, 
+                    'target': pe_entry_price - config.TARGET_PROFIT_PER_LOT 
                 }
                 logger.info(f"Entered Positions. CE Entry: {ce_entry_price}, PE Entry: {pe_entry_price}")
 
