@@ -15,7 +15,8 @@ from auto_symbol_selector import pick_best_symbol
 import oi_analysis_engine
 import hedging_engine
 import timeframe_engine
-import telegram_interface
+
+import performance_engine
 
 
 # -------------------------------------------------------------------------
@@ -55,11 +56,12 @@ def suggest_trade(capital, margin, **kwargs):
     """
     Analyzes market with Advanced Quantitative Logic.
     Strict Compliance: Zerodha Kite Only.
+    Returns: Dict { "status": "WAIT"|"TRADE", "reason": str, "data": dict }
     """
-    # Initialize Logger if not provided (fallback for legacy calls, though we should always pass it)
+    # Initialize Logger
     import logger as logger_module
     if 'logger' not in kwargs:
-         logger = logger_module.TelegramLogger() # Local instance if none passed
+         logger = logger_module.SimpleLogger() # Local instance
     else:
          logger = kwargs['logger']
 
@@ -80,29 +82,25 @@ def suggest_trade(capital, margin, **kwargs):
         # Mapping for Indices check
         idx_map = {"NIFTY": "NSE:NIFTY 50", "BANKNIFTY": "NSE:NIFTY BANK", "FINNIFTY": "NSE:NIFTY FIN SERVICE"}
         lookup_sym = idx_map.get(symbol, f"NSE:{symbol}")
-        
-        # We need kite instance passed to get_ltp or use kite directly here
-        spot_price = kite_data.get_ltp(lookup_sym, kite) # This now handles Index Tokens correctly if name matches
+        spot_price = kite_data.get_ltp(lookup_sym, kite)
 
     if spot_price is None or spot_price == 0:
-        # Try direct generic fetch via token map if name is standard
         spot_price = kite_data.get_ltp(symbol, kite)
 
     if spot_price is None or spot_price == 0:
-        logger.log("[!] Could not fetch Spot Price. Aborting.")
-        return
+        msg = f"[!] Could not fetch Spot Price for {symbol}. Aborting."
+        logger.log(msg)
+        return {"status": "WAIT", "reason": "Data Fetch Failure (Spot Price)"}
 
     # 3. New Quantitative Checks
-    # OI & IV (REAL)
     pcr = oi_analysis_engine.calculate_pcr(kite, symbol)
-    
-    # Get ATM to check IV and OI Signal of the "Tradeable" instrument
     atm = atm_engine.get_atm_strike(spot_price, symbol)
     expiry_data = expiry_engine.get_expiry(symbol)
     
-    # For IV and OI, we check the ATM CE for Bullish/Bearish context or just generic?
-    # User said "get_iv_value" and "IV Rank".
-    # We will pick ATM CE as the reference for IV Rank.
+    if not expiry_data:
+        logger.log("[!] Could not determine Expiry.")
+        return {"status": "WAIT", "reason": "Data Fetch Failure (Expiry)"}
+
     atm_sym_base = expiry_engine.get_option_symbol(symbol, expiry_data['date'], atm, "CE")
     atm_sym = "NFO:" + atm_sym_base
     
@@ -110,7 +108,7 @@ def suggest_trade(capital, margin, **kwargs):
     if iv: oi_analysis_engine.update_iv_history(symbol, iv)
     iv_rank = oi_analysis_engine.calculate_iv_rank(symbol)
     
-    # OI Signal (Using Delta)
+    # OI Signal
     oi_delta, quote_data = oi_analysis_engine.get_oi_delta(kite, atm_sym)
     net_change = quote_data.get('net_change', 0)
     oi_signal = oi_analysis_engine.interpret_oi_signal(net_change, oi_delta)
@@ -128,10 +126,22 @@ def suggest_trade(capital, margin, **kwargs):
     logger.log(f"IV Rank    : {iv_rank} (IV: {iv if iv else 'N/A'})")
     logger.log(f"Spot Price : {spot_price}")
     logger.log("========================================")
+    
+    # --- PERFORMANCE FEEDBACK INTEGRATION ---
+    feedback = performance_engine.get_feedback(current_context={
+        "Regime": trend_dir,
+        "Strategy": "Trend Following" 
+    })
+    
+    logger.log(f"[Quant] Performance Feedback: {feedback}")
+    size_mult = max(0.5, min(1.0, feedback.get('size_multiplier', 1.0)))
+    if size_mult < 1.0:
+        logger.log(f"[!] Throttling Size by {(1-size_mult)*100:.0f}% due to performance history.")
+        
     logger.log(f"Capital: {capital} | Avail Margin: {margin}")
     
     # Decide Strategy
-    final_view = "BULLISH" # Default logic from trend/pcr
+    final_view = "BULLISH"
     if "DOWN" in trend_dir: final_view = "BEARISH"
     elif "UP" in trend_dir: final_view = "BULLISH"
     else:
@@ -139,14 +149,30 @@ def suggest_trade(capital, margin, **kwargs):
         else: final_view = "BULLISH"
         
     logger.log(f"[-] Final View: {final_view}")
-    
+
+    # --- EXTRA CONFIRMATION CHECK (ADAPTIVE) ---
+    if feedback.get('extra_confirmation_required', False):
+        logger.log("[!] Performance Engine requires EXTRA CONFIRMATION.")
+        if volatility == "Low":
+             msg = "[x] Confirmation Failed: Volatility Low + Risk High."
+             logger.log(msg)
+             return {"status": "WAIT", "reason": "Performance Veto (Low Vol + High Risk)"}
+             
+        if final_view == "BULLISH" and pcr < 0.9:
+             msg = f"[x] Confirmation Failed: PCR {pcr:.2f} too low for Risky Bullish Setup."
+             logger.log(msg)
+             return {"status": "WAIT", "reason": f"Performance Veto (PCR {pcr:.2f} Low)"}
+        if final_view == "BEARISH" and pcr > 1.1:
+             msg = f"[x] Confirmation Failed: PCR {pcr:.2f} too high for Risky Bearish Setup."
+             logger.log(msg)
+             return {"status": "WAIT", "reason": f"Performance Veto (PCR {pcr:.2f} High)"}
+             
+        logger.log("[v] Extra Confirmation Passed.")
+
     # ----------------------------------------------------
     # DO-NOT-TRADE (DNT) DETECTOR
     # ----------------------------------------------------
     import dnt_engine
-    
-    # Needs: regime, volatility, trend, spot, iv_rank
-    # Infer regime str like before
     regime_str = market_regime_engine.get_market_regime(symbol if "NIFTY" in symbol else "NIFTY")
     
     dnt_context = {
@@ -162,27 +188,19 @@ def suggest_trade(capital, margin, **kwargs):
     if dnt_res['do_not_trade']:
         logger.log("\n🛑 DO-NOT-TRADE ACTIVE")
         logger.log(f"   Reason: {dnt_res['primary_reason']} ({dnt_res['risk_category']})")
-        logger.log(f"   Note: {dnt_res['notes']}")
-        return
+        return {"status": "WAIT", "reason": f"DNT: {dnt_res['primary_reason']}"}
     
     # ----------------------------------------------------
-    # HIGH IV STRATEGY SWITCH (Force Credit)
+    # HIGH IV STRATEGY SWITCH
     # ----------------------------------------------------
-    # Logic: IF IV > HV+20% OR IVRank > 80 => VETO LONG
-    # We enforce this by hijacking the logic flow below.
-    
-    # Get HV from metrics
+    metrics = market_regime_engine.get_market_metrics(symbol if "NIFTY" in symbol else "NIFTY")
     raw_hv = metrics.get('hv', 0)
     current_iv = iv if iv else 0
     
     high_iv_condition = False
-    
-    # Check IV vs HV (20% buffer -> 1.2x)
-    # HV is annualized %. IV is annualized %.
     if current_iv > (raw_hv * 1.2):
         high_iv_condition = True
         logger.log(f"[!] High IV Detected: IV {current_iv:.1f} > HV {raw_hv:.1f} + 20%")
-        
     if iv_rank > 80:
         high_iv_condition = True
         logger.log(f"[!] Extreme IV Rank Detected: {iv_rank}")
@@ -191,13 +209,10 @@ def suggest_trade(capital, margin, **kwargs):
         logger.log(">>> FORCING SYSTEM TO CREDIT STRATEGIES (SELLING) <<<")
         logger.log(">>> Long Option Entries will be VETOED/SKIPPED.")
     
+    # Double check DNT just in case
     dnt_res = dnt_engine.check_dnt(dnt_context)
-    
     if dnt_res['do_not_trade']:
-        logger.log("\n🛑 DO-NOT-TRADE ACTIVE")
-        logger.log(f"   Reason: {dnt_res['primary_reason']} ({dnt_res['risk_category']})")
-        logger.log(f"   Note: {dnt_res['notes']}")
-        return
+        return {"status": "WAIT", "reason": f"DNT: {dnt_res['primary_reason']}"}
     
     # ----------------------------------------------------
     # EXPECTED MOVE MATH GATE
@@ -205,91 +220,91 @@ def suggest_trade(capital, margin, **kwargs):
     import expected_move_engine
     import greeks_engine
     
-    # We need Greeks for ATM to evaluate general expectancy
-    # Get Market Metrics from engine (now exposed)
-    metrics = market_regime_engine.get_market_metrics(symbol if "NIFTY" in symbol else "NIFTY")
     metrics['spot_price'] = spot_price
     metrics['regime'] = regime_str
     
-    # Fetch ATM Greeks proxy
     atm = atm_engine.get_atm_strike(spot_price, symbol)
-    expiry_data = expiry_engine.get_expiry(symbol)
-    
-    # Use generic calls to greeks_engine for quick check
-    # Need time to expiry
     dte = greeks_engine.calculate_time_to_expiry(expiry_data['date'])
-    # Assume 15% IV if missing for check or use fetched IV
     check_iv = iv if iv else 0.15 
-    # Option Type for View
     check_type = "CE" if final_view == "BULLISH" else "PE"
     
-    # Calc Greeks
-    # S, K, T, r, sigma, type
     greeks_proxy = greeks_engine.get_greeks(spot_price, atm, dte, 0.07, check_iv, check_type)
-    greeks_proxy['iv'] = check_iv * 100 # scale up
+    greeks_proxy['iv'] = check_iv * 100 
     
-    # Candidate Proxy
-    # Need rough premium. 
-    # Use Black Scholes price from Greeks or just fetch?
-    # Fetching is safer.
     check_sym_base = expiry_engine.get_option_symbol(symbol, expiry_data['date'], atm, check_type)
     check_sym = "NFO:" + check_sym_base
-    check_prem = kite_data.get_ltp(check_sym, kite) # Helper wrapper
+    check_prem = kite_data.get_ltp(check_sym, kite) 
     
     if check_prem:
         check_cand = {"premium": check_prem, "type": check_type, "strike": atm}
-        
         math_res = expected_move_engine.evaluate_expectancy(check_cand, metrics, greeks_proxy)
         
         logger.log("\n--- EXPECTANCY CHECK ---")
         if not math_res['allowed']:
-             logger.log(f"📉 MATH VETO: {math_res['decision_reason']}")
-             logger.log(f"   ExpMove: {math_res['expected_spot_move']} vs Cost: {math_res['expected_cost']}")
-             logger.log("   Trade has negative mathematical edge. ABORTING.")
-             return
+             est_delta = abs(greeks_proxy.get('delta', 0.5))
+             gain = math_res['expected_option_gain']
+             cost = math_res['expected_cost']
+             edge = math_res['edge_ratio']
+
+             logger.log("\n-----------------------------------------------------------")
+             logger.log(" ⛔ MATH VETO: Trade has negative mathematical edge.")
+             logger.log("-----------------------------------------------------------")
+             logger.log(f"Reason: {math_res['decision_reason']}")
+
+             logger.log("\n[WHY WAS THIS VETOED?]")
+             logger.log("The Expected Spot Move is not enough to cover the Option Cost")
+             logger.log("because options only capture a fraction (Delta) of the move.")
+
+             logger.log(f"\n[THE MATH]")
+             logger.log(f"• Spot Move Required : {math_res['expected_spot_move']} pts (Based on Volatility)")
+             logger.log(f"• Option Delta       : {est_delta:.2f} (Captures ~{int(est_delta*100)}% of spot move)")
+             logger.log(f"• Expected Option Gain ≈ ₹{gain:.2f} (Spot Move * Delta)")
+             logger.log(f"• Total Cost/Risk      ≈ ₹{cost:.2f} (Stop Loss + Decay + Slippage)")
+
+             logger.log(f"\n[COMPARISON]")
+             logger.log(f"Expected Option Gain (₹{gain:.2f}) < Option Cost (₹{cost:.2f})")
+             logger.log(f"Edge = {edge:.2f} means you expect to get ₹{edge:.2f} back for every ₹1 risked.")
+
+             logger.log(f"\n[CONCLUSION]")
+             logger.log("This trade is mathematically losing even if direction is correct.")
+             logger.log("This setup benefits OPTION SELLERS, not buyers.")
+
+             logger.log(f"\n[WHAT MUST CHANGE?]")
+             logger.log("1. Expected Move must increase (Waiting for stronger breakout?)")
+             logger.log("2. Option Cost must fall (Wait for pullback/lower premiums?)")
+             logger.log("3. Delta must improve (Select a closer strike?)")
+             logger.log("-----------------------------------------------------------")
+             
+             return {"status": "WAIT", "reason": f"Math Veto: {math_res['decision_reason']}"}
         else:
              logger.log(f"✅ PASSED Edge Ratio: {math_res['edge_ratio']}")
     
     # Strike Integration
     atm = atm_engine.get_atm_strike(spot_price, symbol)
-    expiry_data = expiry_engine.get_expiry(symbol)
-    
     final_trade_legs = []
     
-    # --- STRATEGY ROUTING BASED ON MARGIN & CAPITAL ---
-    # UPDATED LOGIC (Prioritize Margin Availability):
-    # Margin >= 1.5L : Option Selling (Best Probability)
-    # Margin >= 50k  : Hedged Spreads (Balanced)
-    # Margin < 50k   : Buy Options (Low Capital/Margin)
-    
-    # Defaults
+    # Default State
     is_hedged = False
     strategy_name = ""
     
     if margin >= 150000:
         # HIGH MARGIN -> Sell Strategies
         logger.log(f"[-] High Margin (>=1.5L). Strategy: OPTION SELLING")
-        # Invert View for Selling
         sell_type = "PE" if final_view == "BULLISH" else "CE"
         action = "SELL"
         opt_type = sell_type 
         
-        # STRICT SYMBOL CONSTRUCTION
-        # Format: <UNDERLYING><YY><MON><STRIKE><CE/PE>
         sym_base = expiry_engine.get_option_symbol(symbol, expiry_data['date'], atm, sell_type)
         sym = "NFO:" + sym_base
-        
-        # 1. FIX LTP + VALIDATION
         prem = validate_option(sym, kite)
         
-        # 8. DO NOT PLACE TRADES WITHOUT VALID LTP
         if prem is None:
-            logger.log(f"[!] Validation Failed for {sym}. Abort trade.")
-            return
+            logger.log(f"[!] Validation Failed for {sym}.")
+            return {"status": "WAIT", "reason": "Option Validation Failed (LTP/Vol)"}
 
-        # Check Margin again
         est_margin = margin_engine.estimate_short_margin(symbol, atm, prem)
         lots = int(margin / est_margin) if est_margin > 0 else 0
+        lots = int(lots * size_mult)
         
         final_trade_legs.append({
             "action": "SELL", "symbol": sym,
@@ -310,83 +325,56 @@ def suggest_trade(capital, margin, **kwargs):
         logger.log(f"    -> Reason: {hedged_strat['reason']}")
         is_hedged = True
         
-        # If Strategy is WAIT, abort
         if strategy_name == "WAIT":
-             return
+             return {"status": "WAIT", "reason": "Hedge Engine suggested WAIT"}
         
-        # Construct Legs
         for leg in hedged_strat['legs']:
-            # STRICT SYMBOL
             leg_sym_base = expiry_engine.get_option_symbol(symbol, expiry_data['date'], leg['strike'], leg['type'])
             leg_sym = "NFO:" + leg_sym_base
-            
             prem = validate_option(leg_sym, kite)
             if prem is None:
                 logger.log(f"[!] Validation Failed for {leg_sym}. Skipping Leg.")
-                # We should strictly abort the whole strategy if one leg fails validation to avoid naked positions
-                logger.log("[!] Strategy Aborted due to leg failure.")
-                return 
+                return {"status": "WAIT", "reason": "Leg Validation Failed (LTP/Vol)"}
                 
             final_trade_legs.append({
                 "action": leg['action'], "symbol": leg_sym,
                 "strike": leg['strike'], "type": leg['type'],
-                "qty": leg['quantity'] * (50 if "NIFTY" in symbol else 15), # 1 Lot approx
+                "qty": int(leg['quantity'] * size_mult) * (50 if "NIFTY" in symbol else 15),
                 "premium": prem
             })
             
     else:
         # LOW MARGIN -> Buy Cheap OTM/ATM
-        
-        # --- HIGH IV GUARD ---
         if high_iv_condition:
-            logger.log("🚫 SKIPPING BUY TRADE: High IV requires Credit Strategy, but margin is insufficient (<50k).")
-            logger.log("   Remaining Cash/Flat to avoid IV Crush.")
-            return
+            logger.log("🚫 SKIPPING BUY TRADE: High IV requires Credit Strategy.")
+            return {"status": "WAIT", "reason": "High IV + Low Margin (Cannot Sell)"}
 
         opt_type = "CE" if final_view == "BULLISH" else "PE"
         logger.log(f"[-] Low Margin (<50k). Strategy: BUY OPTION {opt_type}")
         action = "BUY"
         
-        # OTM Engine needs 'kite' passed
         otm_data = otm_engine.find_affordable_otm(capital, symbol, atm, expiry_data, opt_type, kite)
         
-        # Validate the OTM pick
         if otm_data["premium"] is None or otm_data["premium"] == 0:
              logger.log("[!] No valid premium found for Buying. Abort.")
-             return
+             return {"status": "WAIT", "reason": "No Affordable Option Found"}
              
-        # Double Check Validation on the found symbol
-        # OTM engine might have returned a symbol, but we need to check Vol/OI
         check_prem = validate_option(otm_data["symbol"], kite)
         if not check_prem:
              logger.log("[!] Selected OTM failed strict validation (Vol/OI).")
-             return
+             return {"status": "WAIT", "reason": "OTM Validation Failed"}
 
         final_trade_legs.append({
             "action": "BUY", "symbol": otm_data["symbol"], 
             "strike": otm_data["strike"], "type": opt_type, 
-            "qty": otm_data["qty"], 
+            "qty": int(otm_data["qty"] * size_mult), 
             "premium": otm_data["premium"]
         })
     
-    
-    # 5. Output Trade Plan
-    # ----------------------------------------------------
-    # FINAL VETO GATE (Imported Engine)
-    # ----------------------------------------------------
+    # 5. Output Trade Plan (Veto Check)
     import trade_veto_engine
     
-    # Context for Veto
-    # Needs: regime, trend, volatility, spot_price, iv_rank
-    # We have: trend_dir, volatility, spot_price, iv, iv_rank
-    # Get Regime from engine directly or infer?
-    # pick_best_symbol returns trend_dir but market_regime_engine returns precise string.
-    # Let's simple infer or assume trend_dir contains it slightly.
-    # Ideally: market_regime_engine.get_market_regime(symbol) was called?
-    # Actually wait, pick_best_symbol logic uses it internally maybe?
-    # Let's call it explicitly to be safe for Veto inputs.
-    
-    regime_str = market_regime_engine.get_market_regime(symbol if "NIFTY" in symbol else "NIFTY") # Proxy
+    regime_str = market_regime_engine.get_market_regime(symbol if "NIFTY" in symbol else "NIFTY") 
     veto_context = {
         "regime": regime_str,
         "trend": trend_dir,
@@ -397,18 +385,17 @@ def suggest_trade(capital, margin, **kwargs):
     
     logger.log("\n--- VETO CHECK ---")
     
-    # Check each leg
     legs_to_keep = []
     trade_blocked = False
+    block_reason = ""
     
     for leg in final_trade_legs:
-        # Prepare Candidate Dict
         cand = {
             "symbol": leg['symbol'],
-            "action": leg['action'], # BUY/SELL
-            "type": leg['type'],     # CE/PE
+            "action": leg['action'], 
+            "type": leg['type'], 
             "strike": leg['strike'],
-            "expiry": expiry_data['date'], # Needs datetime or algo handled
+            "expiry": expiry_data['date'],
             "premium": leg['premium']
         }
         
@@ -417,16 +404,16 @@ def suggest_trade(capital, margin, **kwargs):
         if veto_res['veto']:
             logger.log(f"🚫 BLOCKED: {leg['symbol']}")
             logger.log(f"   Reason: {veto_res['veto_reason']} ({veto_res['veto_category']})")
-            logger.log(f"   Details: {veto_res['details']}")
             trade_blocked = True
-            break # Block whole strategy if one leg is bad? Usually yes for single/spreads.
+            block_reason = veto_res['veto_reason']
+            break 
         else:
             logger.log(f"✅ PASSED: {leg['symbol']}")
             legs_to_keep.append(leg)
             
     if trade_blocked:
         logger.log("✋ Trade Aborted due to Veto.")
-        return
+        return {"status": "WAIT", "reason": f"Veto: {block_reason}"}
 
     # If passed, print plan
     logger.log("\n========================================")
@@ -438,39 +425,36 @@ def suggest_trade(capital, margin, **kwargs):
     
     for leg in final_trade_legs:
         val = leg['qty'] * leg['premium']
-
-        # Calculate SL/Target for Display
         sl_price = 0
         target_price = 0
         if leg['action'] == "BUY":
-            sl_price = leg['premium'] * 0.80   # 20% SL
-            target_price = leg['premium'] * 1.30 # 30% Target
+            sl_price = leg['premium'] * 0.80   
+            target_price = leg['premium'] * 1.30 
             total_cost += val
         else:
-            sl_price = leg['premium'] * 1.30   # 30% SL (Short)
-            target_price = leg['premium'] * 0.50 # 50% Target (Short)
-            total_cost -= val # Premium received
-            
-            # Simple margin est
-            total_margin += 60000 # Rough est per lot short
+            sl_price = leg['premium'] * 1.30   
+            target_price = leg['premium'] * 0.50 
+            total_cost -= val 
+            total_margin += 60000 
 
         logger.log(f"Leg {final_trade_legs.index(leg)+1}: {leg['action']} {leg['symbol']} @ {leg['premium']}")
         logger.log(f"       Qty: {leg['qty']} | Val: {val:.2f}")
         logger.log(f"       [SL]: {sl_price:.2f} | [Tgt]: {target_price:.2f}")
 
-        # Store for alert
         leg['sl'] = sl_price
         leg['target'] = target_price
             
     logger.log(f"Net Premium Impact: {total_cost:.2f} ({'Debit' if total_cost > 0 else 'Credit'})")
     logger.log(f"\nEst. Capital/Margin Req: {total_margin if total_margin > 0 else total_cost:.2f}")
 
-    # 7. Send Telegram Alert
-    alert_msg = f"🚀 *Trade Suggestion*\n\n"
-    alert_msg += f"Symbol: {symbol}\nView: {final_view}\nStrateg: {strategy_name if is_hedged else (action + ' ' + opt_type)}\n"
-    alert_msg += f"Spot: {spot_price}\n\n*Legs:*\n"
-    for leg in final_trade_legs:
-        alert_msg += f"{leg['action']} {leg['symbol']} @ {leg['premium']}\nTo: 🎯 {leg['target']:.1f} | 🛑 {leg['sl']:.1f}\n(Qty: {leg['qty']})\n"
-    alert_msg += f"\nEst. Cost: {total_margin if total_margin > 0 else total_cost:.2f}"
-    
-    telegram_interface.send_alert(alert_msg)
+    return {
+        "status": "TRADE", 
+        "reason": "All Conditions Met",
+        "data": {
+            "strategy": strategy_name if is_hedged else f"{action} {opt_type}",
+            "cost": total_cost,
+            "margin": total_margin,
+            "legs": final_trade_legs
+        }
+    }
+

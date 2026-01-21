@@ -22,7 +22,15 @@ def find_affordable_otm(capital, base_symbol, atm, expiry_data, opt_type, kite):
     Now uses strict 'kite' instance and 'expiry_engine' symbol builder.
     """
     # Determine Gap
-    gap = 100 if "BANKNIFTY" in base_symbol else 50
+    # Strict Logic for Indices vs Stocks
+    if "BANKNIFTY" in base_symbol or "NIFTY BANK" in base_symbol:
+        gap = 100
+    elif "FINNIFTY" in base_symbol or "NIFTY FIN" in base_symbol:
+        gap = 50
+    elif "NIFTY" in base_symbol and "FIN" not in base_symbol:
+        gap = 50
+    else:
+        gap = 10
     
     strikes = get_otm_strikes(atm, gap, opt_type, count=5)
     

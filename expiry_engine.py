@@ -52,14 +52,16 @@ def get_option_symbol(underlying, expiry_date, strike, otype):
     --- 3. FIX EXPIRY FORMAT FOR ZERODHA ---
     Format: <UNDERLYING><YY><MON><STRIKE><CE/PE>
     """
-    # Force Underlying Name Standard (NIFTY 50 -> NIFTY)
-    # Force Underlying Name Standard (NIFTY 50 -> NIFTY)
-    if underlying == "NIFTY 50" or underlying == "NIFTY":
-         underlying = "NIFTY"
-    elif underlying == "NIFTY BANK" or underlying == "BANKNIFTY":
-         underlying = "BANKNIFTY"
-    elif underlying == "NIFTY FIN SERVICE" or underlying == "FINNIFTY":
-         underlying = "FINNIFTY"
+    # Force Underlying Name Standard (NIFTY 50 -> NIFTY, BANKNIFTY -> BANKNIFTY)
+    # Be careful not to corrupt HDFCBANK -> BANKNIFTY
+    
+    if "BANKNIFTY" in underlying or "NIFTY BANK" in underlying:
+        underlying = "BANKNIFTY"
+    elif "FINNIFTY" in underlying or "NIFTY FIN" in underlying:
+        underlying = "FINNIFTY"
+    elif "NIFTY" in underlying and "FIN" not in underlying:
+        underlying = "NIFTY"
+    # Else keep as is (e.g. HDFCBANK, RELIANCE)
     
     year = expiry_date.strftime("%y")             # -> "24"
     month = expiry_date.strftime("%b").upper()    # -> "JAN"
