@@ -55,21 +55,32 @@ def calculate_pcr(kite, underlying):
     total_put_oi = 0
     total_call_oi = 0
     
-    # Batch size for Quote API (Zerodha allows ~200-500 depending on app)
-    BATCH_SIZE = 250 
+    # Batch size for Quote API (Reduced to 100 to avoid 504 Timeouts)
+    BATCH_SIZE = 100
+    
+    import time
     
     for i in range(0, len(symbols), BATCH_SIZE):
         batch = symbols[i:i+BATCH_SIZE]
-        try:
-            quotes = kite.quote(batch)
-            for sym, data in quotes.items():
-                oi = data.get('oi', 0)
-                if sym.endswith("PE"):
-                    total_put_oi += oi
-                elif sym.endswith("CE"):
-                    total_call_oi += oi
-        except Exception as e:
-            print(f"Error fetching batch PCR: {e}")
+        
+        # Retry Logic for Flaky API/Timeouts
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                quotes = kite.quote(batch)
+                for sym, data in quotes.items():
+                    oi = data.get('oi', 0)
+                    if sym.endswith("PE"):
+                        total_put_oi += oi
+                    elif sym.endswith("CE"):
+                        total_call_oi += oi
+                break # Success, exit retry loop
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    time.sleep(1.0) # Wait 1s before retry
+                    continue
+                else:
+                    print(f"Error fetching batch PCR (Final Attempt): {e}")
             
     if total_call_oi == 0:
         return 1.0
