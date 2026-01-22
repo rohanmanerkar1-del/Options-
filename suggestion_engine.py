@@ -52,7 +52,7 @@ def validate_option(symbol, kite):
         
     return ltp
 
-def suggest_trade(capital, margin, **kwargs):
+def _suggest_trade_logic(capital, margin, **kwargs):
     """
     Analyzes market with Advanced Quantitative Logic.
     Strict Compliance: Zerodha Kite Only.
@@ -458,3 +458,35 @@ def suggest_trade(capital, margin, **kwargs):
         }
     }
 
+
+# -------------------------------------------------------------------------
+# WRAPPER FOR TELEGRAM INTEGRATION
+# -------------------------------------------------------------------------
+def suggest_trade(capital, margin, **kwargs):
+    """
+    Wrapper function that:
+    1. Initializes Logger
+    2. Runs analysis (_suggest_trade_logic)
+    3. Flushes logs to Telegram
+    4. Returns Result
+    """
+    import logger as logger_module
+    
+    # Use provided logger or create new one
+    if 'logger' in kwargs:
+        logger = kwargs['logger']
+    else:
+        logger = logger_module.SimpleLogger()
+        kwargs['logger'] = logger
+        
+    try:
+        # Run Core Logic
+        result = _suggest_trade_logic(capital, margin, **kwargs)
+        return result
+    except Exception as e:
+        logger.log(f"[!] Critical Error in Suggestion Engine: {e}")
+        return {"status": "WAIT", "reason": f"Crash: {e}"}
+    finally:
+        # ALWAYS flush logs to Telegram at the end
+        if hasattr(logger, 'flush_to_telegram'):
+            logger.flush_to_telegram()
